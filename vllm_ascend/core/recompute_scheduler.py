@@ -50,6 +50,12 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
+from vllm_ascend.core.dyntra_lb_scheduler import (
+    DyntraLBPolicyMixin,
+    diagnostics_enabled,
+    print_scheduler_summary,
+)
+
 
 @dataclass
 class RecomputeSchedulerConfig(SchedulerConfig):
@@ -94,6 +100,7 @@ class RecomputeSchedulerOutput(SchedulerOutput):
 
 class RecomputeScheduler(Scheduler):
     running: list[Request]
+    prefill_capacity_bound: bool
 
     def _get_computed_blocks_for_connector(self, request: Request) -> tuple[KVCacheBlocks, int, int, bool]:
         kv_cache_manager = self.kv_cache_manager
@@ -132,6 +139,14 @@ class RecomputeScheduler(Scheduler):
 
         blocks, num_local, shared_prefix_boundary = kv_cache_manager.get_computed_blocks(request)
         return blocks, num_local, shared_prefix_boundary, False
+
+    def _apply_load_balance_modifications(self) -> None:
+        """Apply optional scheduling-policy changes before running requests."""
+        return
+
+    def _can_admit_waiting_request(self, request: Request) -> bool:
+        """Return whether an optional policy allows this waiting request."""
+        return True
 
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """
@@ -198,6 +213,8 @@ class RecomputeScheduler(Scheduler):
         preempted_reqs: list[Request] = []
         preempted_req_data: list[PreemptedRequestData] = []
         recomputed_reqs: list[RecomputeReqInfo] = []
+
+        self._apply_load_balance_modifications()
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -494,6 +511,11 @@ class RecomputeScheduler(Scheduler):
                             "[RecomputeScheduler] %s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
+                if not self._can_admit_waiting_request(request):
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -936,6 +958,8 @@ class RecomputeScheduler(Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if diagnostics_enabled(self.vllm_config):
+            print_scheduler_summary(self, scheduler_output)
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1288,3 +1312,11 @@ class RecomputeScheduler(Scheduler):
 class AsyncRecomputeScheduler(AsyncScheduler, RecomputeScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+
+class DyntraLBRecomputeScheduler(DyntraLBPolicyMixin, RecomputeScheduler):
+    pass
+
+
+class AsyncDyntraLBRecomputeScheduler(DyntraLBPolicyMixin, AsyncRecomputeScheduler):
+    pass
