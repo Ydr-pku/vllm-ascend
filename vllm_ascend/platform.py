@@ -937,6 +937,18 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         vllm_config.additional_config = {}
         additional_config = vllm_config.additional_config
     scheduler_extension_config = ascend_config.scheduler_config
+    _select_decoder_append_prefill_scheduler(vllm_config, scheduler_extension_config)
+    decoder_append = _is_decoder_append_prefill_scheduler(vllm_config.scheduler_config.scheduler_cls)
+    if decoder_append:
+        incompatible = {
+            "balance": scheduler_extension_config.enable_balance_scheduling,
+            "dyntra_lb": scheduler_extension_config.dyntra_lb_config.enabled,
+            "short_request_first": scheduler_extension_config.short_request_first_config.enabled,
+            "profiling_chunk": scheduler_extension_config.profiling_chunk_config.enabled,
+            "batch_job": scheduler_extension_config.batch_job_sched_config.enabled,
+        }
+        if conflicts := [name for name, enabled in incompatible.items() if enabled]:
+            raise ValueError("Decoder append-prefill is incompatible with: " + ", ".join(conflicts))
 
     # enable_balance_scheduling: only supported in PD-mixed mode
     if scheduler_extension_config.enable_balance_scheduling:
@@ -1040,6 +1052,7 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
             recompute_scheduler_config.scheduler_cls = _get_recompute_scheduler_cls(
                 async_scheduling=async_scheduling,
                 dyntra_lb_enabled=dyntra_lb_config.enabled,
+                decoder_append_prefill=decoder_append,
             )
             vllm_config.scheduler_config = recompute_scheduler_config
 
@@ -1468,11 +1481,86 @@ def _prune_reduced_capture_sizes(vllm_config):
     )
 
 
+def _select_decoder_append_prefill_scheduler(vllm_config, extension_config) -> None:
+    """Install admission capability on default D schedulers; routing stays proxy-controlled."""
+    if getattr(vllm_config.kv_transfer_config, "kv_role", None) != "kv_consumer":
+        return
+    selected = vllm_config.scheduler_config.scheduler_cls
+    if selected is not None:
+        if isinstance(selected, type):
+            selected = f"{selected.__module__}.{selected.__name__}"
+        recompute_classes = {
+            f"vllm_ascend.core.recompute_scheduler.{name}"
+            for name in (
+                "RecomputeScheduler",
+                "AsyncRecomputeScheduler",
+                "DyntraLBRecomputeScheduler",
+                "AsyncDyntraLBRecomputeScheduler",
+            )
+        }
+        if (
+            getattr(extension_config, "recompute_scheduler_enable", False)
+            and not _is_decoder_append_prefill_scheduler(selected)
+            and selected not in recompute_classes
+        ):
+            raise ValueError("recompute_scheduler_enable cannot override an explicit custom scheduler_cls.")
+        return
+    if extension_config.enable_balance_scheduling or any(
+        getattr(extension_config, name).enabled
+        for name in (
+            "dyntra_lb_config",
+            "short_request_first_config",
+            "profiling_chunk_config",
+            "batch_job_sched_config",
+        )
+    ):
+        return
+    name = (
+        "AsyncDecoderAppendPrefillScheduler"
+        if vllm_config.scheduler_config.async_scheduling
+        else "DecoderAppendPrefillScheduler"
+    )
+    vllm_config.scheduler_config.scheduler_cls = f"vllm_ascend.core.decoder_append_prefill_scheduler.{name}"
+
+
+def _decoder_append_prefill_capabilities(vllm_config) -> dict:
+    return {
+        "protocol_version": 1,
+        "decoder_cache_admission": (
+            getattr(vllm_config.kv_transfer_config, "kv_role", None) == "kv_consumer"
+            and bool(vllm_config.cache_config.enable_prefix_caching)
+            and _is_decoder_append_prefill_scheduler(vllm_config.scheduler_config.scheduler_cls)
+        ),
+    }
+
+
+def _is_decoder_append_prefill_scheduler(scheduler_cls) -> bool:
+    if isinstance(scheduler_cls, type):
+        scheduler_cls = f"{scheduler_cls.__module__}.{scheduler_cls.__name__}"
+    return scheduler_cls in {
+        "vllm_ascend.core.decoder_append_prefill_scheduler.DecoderAppendPrefillScheduler",
+        "vllm_ascend.core.decoder_append_prefill_scheduler.AsyncDecoderAppendPrefillScheduler",
+        "vllm_ascend.core.decoder_append_prefill_scheduler.DecoderAppendPrefillRecomputeScheduler",
+        "vllm_ascend.core.decoder_append_prefill_scheduler.AsyncDecoderAppendPrefillRecomputeScheduler",
+    }
+
+
 def _get_recompute_scheduler_cls(
     *,
     async_scheduling: bool,
     dyntra_lb_enabled: bool,
+    decoder_append_prefill: bool = False,
 ) -> str:
+    if decoder_append_prefill:
+        if dyntra_lb_enabled:
+            raise ValueError("DyntraLB requires decode-only Decoders and cannot use decoder append-prefill.")
+        module = "vllm_ascend.core.decoder_append_prefill_scheduler"
+        name = (
+            "AsyncDecoderAppendPrefillRecomputeScheduler"
+            if async_scheduling
+            else "DecoderAppendPrefillRecomputeScheduler"
+        )
+        return f"{module}.{name}"
     if dyntra_lb_enabled:
         if async_scheduling:
             return "vllm_ascend.core.recompute_scheduler.AsyncDyntraLBRecomputeScheduler"

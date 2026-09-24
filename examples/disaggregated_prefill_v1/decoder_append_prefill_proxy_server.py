@@ -8,11 +8,11 @@ Run this standalone example with httpx, fastapi, anyio and uvicorn installed::
         --host 127.0.0.1 --port 9000 --workers 1 \
         --prefiller-hosts 127.0.0.1 --prefiller-ports 8100 \
         --decoder-hosts 127.0.0.1 --decoder-ports 8200 \
-        --decoder-append-routing-mode explicit --decoder-data-parallel-size 2
+        --enable-decoder-append-prefill --decoder-data-parallel-size 2
 
-Send a stable X-Session-ID on each turn. In explicit mode, add
-X-vLLM-Request-Mode: decoder-local to warm turns; cold sessions use P/D.
-The default routing mode is off. Auto mode routes all warm turns locally.
+Send a stable X-Session-ID on each turn. The feature is disabled by default.
+When enabled, cold sessions use P/D and warm sessions use their pinned Decoder.
+The proxy checks Decoder admission capability at startup and before local routing.
 
 Decoder-local routing requires Decoder prefix caching and backend support for
 vllm_xargs.require_decoder_cache_hit: reject a zero-hit request before prefill
@@ -21,6 +21,8 @@ must preserve this zero-token terminal event. The proxy then retries through
 P/D with the original history and generation budget. Cache loss after output
 must report decoder_cache_lost_after_output; it must never replay the request.
 Session affinity alone does not prove that a prefix remains resident.
+Decoder-local append-prefill is currently unsupported with DyntraLB, which
+requires Decoder instances to execute decode-only work.
 
 The operator must change --decoder-engine-epoch and restart this proxy after
 restarting Decoders. Each Decoder endpoint's DP size must match the CLI setting.
@@ -172,9 +174,7 @@ class BackendContractError(RuntimeError):
 
 TAINT_PRIORITY = 1e15
 SESSION_ID_HEADER = "X-Session-ID"
-REQUEST_MODE_HEADER = "X-vLLM-Request-Mode"
 DP_RANK_HEADER = "X-data-parallel-rank"
-DECODER_LOCAL_REQUEST_MODES = {"decoder-local", "decoder-append-prefill"}
 
 
 def extract_cached_tokens(response_json: dict) -> int | None:
@@ -742,6 +742,32 @@ class WorkerRuntime:
             await self.sync_clients()
         return clients[key]
 
+    async def check_decoder_admission(self, key: str) -> None:
+        """Fail closed for unsupported or changed backends, including newly added nodes."""
+        try:
+            client = await self.get_client(ServerRole.DECODE, key)
+        except KeyError as exc:
+            raise RuntimeError("Pinned Decoder is no longer available") from exc
+        try:
+            response = await client.get(
+                "/decoder_append_prefill/capabilities",
+                headers=auth_headers(next_req_id()),
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            capability = response.json()
+            if (
+                not isinstance(capability, dict)
+                or capability.get("protocol_version") != 1
+                or capability.get("decoder_cache_admission") is not True
+            ):
+                raise ValueError("Decoder does not support local cache admission")
+        except (httpx.HTTPError, ValueError) as exc:
+            raise BackendContractError(
+                f"Decoder {key} does not advertise decoder append-prefill admission support",
+                code="unsupported_decoder_admission",
+            ) from exc
+
     async def sync_clients(self) -> None:
         snapshot = self.scheduler.get_snapshot()
         role_targets = {
@@ -908,13 +934,9 @@ def parse_args() -> argparse.Namespace:
         help="Log level for the proxy server.",
     )
     parser.add_argument(
-        "--decoder-append-routing-mode",
-        choices=["off", "explicit", "auto"],
-        default="off",
-        help=(
-            "Route warm sessions to their pinned Decoder. 'explicit' requires "
-            "X-vLLM-Request-Mode: decoder-local; 'auto' routes every warm session locally."
-        ),
+        "--enable-decoder-append-prefill",
+        action="store_true",
+        help="Route warm sessions to their pinned Decoder; cold sessions and cache misses use P/D.",
     )
     parser.add_argument(
         "--session-affinity-ttl",
@@ -999,15 +1021,18 @@ async def lifespan(_app: FastAPI):
     else:
         scheduler = _ensure_scheduler(args)
     runtime = WorkerRuntime(scheduler)
-    await runtime.sync_clients()
-    snapshot = scheduler.get_snapshot()
-    logger.info(
-        "Initialized %s prefill clients and %s decode clients in worker %s.",
-        len(snapshot["prefill_instances"]),
-        len(snapshot["decode_instances"]),
-        os.getpid(),
-    )
     try:
+        await runtime.sync_clients()
+        if args.enable_decoder_append_prefill:
+            for key in runtime._clients[ServerRole.DECODE]:
+                await runtime.check_decoder_admission(key)
+        snapshot = scheduler.get_snapshot()
+        logger.info(
+            "Initialized %s prefill clients and %s decode clients in worker %s.",
+            len(snapshot["prefill_instances"]),
+            len(snapshot["decode_instances"]),
+            os.getpid(),
+        )
         yield
     finally:
         await runtime.close()
@@ -1101,7 +1126,7 @@ async def plan_request_route(request: Request, req_data: dict) -> RoutePlan:
     if req_data.get("vllm_xargs") is not None:
         req_data["vllm_xargs"] = dict(req_data["vllm_xargs"])
         req_data["vllm_xargs"].pop("require_decoder_cache_hit", None)
-    if args.decoder_append_routing_mode == "off":
+    if not args.enable_decoder_append_prefill:
         return RoutePlan(RouteMode.PD, "feature_disabled")
 
     session_id = request.headers.get(SESSION_ID_HEADER)
@@ -1122,11 +1147,9 @@ async def plan_request_route(request: Request, req_data: dict) -> RoutePlan:
             session_reserved=True,
         )
 
-    explicit_decoder_local = request.headers.get(REQUEST_MODE_HEADER, "").lower() in DECODER_LOCAL_REQUEST_MODES
-    use_decoder_local = args.decoder_append_routing_mode == "auto" or explicit_decoder_local
     return RoutePlan(
-        RouteMode.DECODER_LOCAL if use_decoder_local else RouteMode.PD,
-        "affinity_hit" if use_decoder_local else "warm_pd",
+        RouteMode.DECODER_LOCAL,
+        "affinity_hit",
         session_id=session_id,
         pinned_decoder_key=reservation["decoder_key"],
         pinned_decoder_dp_rank=reservation["decoder_dp_rank"],
@@ -1370,6 +1393,7 @@ async def assign_decoder_local(
     if route.pinned_decoder_key is None or route.pinned_decoder_dp_rank is None:
         raise RuntimeError("Decoder-local route requires a pinned Decoder and DP rank")
     runtime = get_runtime()
+    await runtime.check_decoder_admission(route.pinned_decoder_key)
     decoder_score = calculate_decode_score(request_length)
     decoder = await runtime.schedule(
         "begin_decoder_request", route.pinned_decoder_key, decoder_score, route.pinned_decoder_dp_rank
@@ -1395,6 +1419,8 @@ async def assign_request(api: str, req_data: dict, request_length: int, route: R
     if route.mode is RouteMode.DECODER_LOCAL:
         try:
             return await assign_decoder_local(api, req_data, request_length, route)
+        except BackendContractError:
+            raise
         except RuntimeError:
             logger.warning(
                 "Decoder-local route for session %s lost its pinned Decoder; falling back to PD",

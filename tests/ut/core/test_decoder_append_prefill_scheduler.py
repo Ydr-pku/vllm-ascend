@@ -80,6 +80,7 @@ def runtime():
         time=time,
         defaultdict=defaultdict,
         SchedulerInterface=object,
+        SupportsHMA=type("SupportsHMA", (), {}),
         MULTIMODAL_REGISTRY=None,
         Request=TestRequest,
         EngineCoreOutputs=Output,
@@ -102,13 +103,40 @@ def runtime():
     namespace["create_request_queue"] = lambda policy: namespace["FCFSRequestQueue"]()
     execute_classes(VLLM / "v1/core/sched/scheduler.py", {"Scheduler"}, namespace)
     execute_classes(VLLM / "v1/core/sched/async_scheduler.py", {"AsyncScheduler"}, namespace)
-    execute_classes(SOURCE, {"DecoderAppendPrefillScheduler", "AsyncDecoderAppendPrefillScheduler"}, namespace)
+    execute_classes(
+        SOURCE,
+        {"DecoderCacheAdmissionMixin", "DecoderAppendPrefillScheduler", "AsyncDecoderAppendPrefillScheduler"},
+        namespace,
+    )
+    namespace.update(
+        RecomputeSchedulerOutput=Output,
+        RecomputeReqInfo=lambda **kwargs: SimpleNamespace(**kwargs),
+        FinishReason=SimpleNamespace(STOP="stop"),
+        vllm_version_is=lambda version: False,
+    )
+    execute_classes(ROOT / "vllm_ascend/core/recompute_scheduler.py", {"RecomputeScheduler"}, namespace)
+    execute_classes(
+        SOURCE,
+        {"DecoderAppendPrefillRecomputeScheduler", "AsyncDecoderAppendPrefillRecomputeScheduler"},
+        namespace,
+    )
     return SimpleNamespace(**namespace)
 
 
-@pytest.fixture(params=["DecoderAppendPrefillScheduler", "AsyncDecoderAppendPrefillScheduler"])
+@pytest.fixture(
+    params=[
+        "DecoderAppendPrefillScheduler",
+        "AsyncDecoderAppendPrefillScheduler",
+        "DecoderAppendPrefillRecomputeScheduler",
+        "AsyncDecoderAppendPrefillRecomputeScheduler",
+    ]
+)
 def scheduler(runtime, request):
-    cls = getattr(runtime, request.param)
+    return make_scheduler(runtime, request.param)
+
+
+def make_scheduler(runtime, class_name):
+    cls = getattr(runtime, class_name)
     scheduler = cls.__new__(cls)
     empty_blocks = SimpleNamespace(get_block_ids=lambda: ([],), blocks=([],))
     scheduler.__dict__.update(
@@ -131,6 +159,9 @@ def scheduler(runtime, request):
         num_waiting_for_streaming_input=0,
         lora_config=None,
         connector=None,
+        requires_kv_delivery=False,
+        connector_prefix_cache_stats=None,
+        needs_kv_cache_zeroing=False,
         ec_connector=None,
         aux_output_connector=None,
         prefix_replay_tokens=0,
@@ -169,6 +200,9 @@ def scheduler(runtime, request):
         kv_event_publisher=Mock(),
     )
     manager = scheduler.kv_cache_manager
+    manager.get_blocks.return_value = empty_blocks
+    manager.get_block_ids.return_value = ([],)
+    manager.get_block_ids_for_computed_tokens.return_value = ([],)
     manager.empty_kv_cache_blocks = empty_blocks
     manager.get_computed_blocks.return_value = (empty_blocks, 0, 0)
     manager.allocate_slots.return_value = empty_blocks
@@ -434,6 +468,10 @@ def test_constructor_preserves_async_setup(runtime, monkeypatch, async_enabled):
     config.scheduler_config.async_scheduling = not async_enabled
     with pytest.raises(ValueError, match="matching async_scheduling"):
         cls(vllm_config=config)
+    policy.dyntra_lb_config.enabled = True
+    with pytest.raises(ValueError, match="DyntraLB is currently unsupported.*decode-only"):
+        cls(vllm_config=config)
+    policy.dyntra_lb_config.enabled = False
     policy.recompute_scheduler_enable = True
     with pytest.raises(ValueError, match="recompute"):
         cls(vllm_config=config)
@@ -477,3 +515,481 @@ def test_mixed_batch_delivers_normal_output_and_rejection(runtime, scheduler):
     if isinstance(scheduler, runtime.AsyncScheduler):
         assert normal.num_output_placeholders == 0
         scheduler.kv_cache_manager.cache_blocks.assert_called_once_with(normal, 32)
+
+
+@pytest.fixture(params=["DecoderAppendPrefillRecomputeScheduler", "AsyncDecoderAppendPrefillRecomputeScheduler"])
+def combined(runtime, request):
+    return make_scheduler(runtime, request.param)
+
+
+def recovery_connector(*, pending=False, available=True):
+    return Mock(
+        has_preempted_request=Mock(return_value=available),
+        get_num_new_matched_tokens=Mock(return_value=(None, False) if pending else (16, True)),
+        requires_kv_delivery=False,
+        request_finished=Mock(return_value=(False, None)),
+        take_events=Mock(return_value=None),
+    )
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_recompute_restores_same_request_without_local_hit(runtime, combined, pending):
+    req = enqueue(runtime, combined, output_tokens=1)
+    combined.connector = recovery_connector(pending=pending)
+    result = combined.schedule()
+    assert not result.num_scheduled_tokens
+    assert not combined._pending_decoder_cache_rejections
+    combined.connector.get_num_new_matched_tokens.assert_called_once_with(req, 0)
+    if pending:
+        combined.kv_cache_manager.allocate_slots.assert_not_called()
+    else:
+        assert req.status == runtime.RequestStatus.WAITING_FOR_REMOTE_KVS
+        assert combined.kv_cache_manager.allocate_slots.call_args.kwargs["delay_cache_blocks"]
+        assert req.num_computed_tokens == 16
+
+
+def test_recompute_does_not_treat_preemption_count_as_recovery_state(runtime, combined):
+    enqueue(runtime, combined, output_tokens=1)
+    combined.connector = recovery_connector(available=False)
+    batch = combined.schedule()
+    combined.connector.get_num_new_matched_tokens.assert_not_called()
+    result = combined.update_from_output(batch, empty_model_output())
+    assert result[2].outputs[0].stop_reason == "decoder_cache_lost_after_output"
+
+
+@pytest.mark.parametrize("marked", [False, True])
+@pytest.mark.parametrize("offload", ["saved", "full", "exception"])
+def test_recompute_preemption_preserves_protocol_and_batch_order(runtime, combined, marked, offload):
+    req = enqueue(runtime, combined, marked=marked, hits=16)
+    earlier = combined.schedule()
+    combined.running.remove(req)
+    combined.connector = recovery_connector()
+    hook = combined.connector.update_state_before_preempt
+    hook.return_value = offload == "saved"
+    if offload == "exception":
+        hook.side_effect = RuntimeError("CPU offload failed")
+    combined._recomputed_reqs = []
+    combined._step_decoder_rejections = []
+    saved = combined._preempt_or_recompute(req, 1.0)
+    assert saved == (offload == "saved")
+    if saved:
+        assert req.status == runtime.RequestStatus.PREEMPTED
+        assert not combined._step_decoder_rejections and not combined._recomputed_reqs
+        return
+    batch = Output(recomputed_reqs=combined._recomputed_reqs, num_scheduled_tokens={}, total_num_scheduled_tokens=0)
+    combined._record_decoder_cache_rejections(batch, combined._step_decoder_rejections)
+    if marked:
+        # The original in-flight batch must still be delivered before rejection.
+        output = empty_model_output()
+        output.sampled_token_ids = [[42]]
+        output.req_id_to_index = {req.request_id: 0}
+        result = combined.update_from_output(earlier, output)
+        assert result[2].outputs[0].new_token_ids == [42]
+        assert not combined._recomputed_reqs
+    result = combined.update_from_output(batch, empty_model_output())
+    assert [out.stop_reason for out in result[2].outputs] == [
+        "decoder_cache_lost_after_output" if marked else "recomputed"
+    ]
+    assert req.request_id not in combined.requests
+
+
+@pytest.mark.parametrize("outputs", [0, 1])
+def test_failed_restore_terminates_without_scheduling_local_recompute(runtime, combined, outputs):
+    req = enqueue(runtime, combined, output_tokens=outputs)
+    req.status = runtime.RequestStatus.WAITING_FOR_REMOTE_KVS
+    req.num_preemptions = 1
+    combined.connector = recovery_connector(available=False)
+    combined.failed_recving_kv_req_ids = {req.request_id}
+    combined.finished_recving_kv_req_ids = {req.request_id}
+    combined.needs_kv_cache_zeroing = False
+    batch = combined.schedule()
+    assert not batch.num_scheduled_tokens
+    result = combined.update_from_output(batch, empty_model_output())
+    assert result[2].outputs[0].stop_reason == ("decoder_cache_lost_after_output" if outputs else "decoder_cache_miss")
+    combined.kv_cache_manager.allocate_slots.assert_not_called()
+
+
+@pytest.mark.parametrize("decode_first", [False, True])
+def test_combined_mixed_batch_does_not_pad_decode_in_either_order(runtime, combined, decode_first):
+    combined.num_spec_tokens = 2
+    combined._spec_token_placeholders = [-1, -1]
+    names = ["decode", "append"] if decode_first else ["append", "decode"]
+    for name in names:
+        req = enqueue(runtime, combined, name, hits=16)
+        if name == "decode":
+            req.num_tokens = req.num_prompt_tokens = 17
+    batch = combined.schedule()
+    assert batch.num_scheduled_tokens == {"decode": 1, "append": 16}
+    # Async scheduling may add draft placeholders after scheduling; they must
+    # not turn this first decode into a padded three-token allocation.
+    allocations = {
+        call.args[0].request_id: call.args[1] for call in combined.kv_cache_manager.allocate_slots.call_args_list
+    }
+    assert allocations == {"decode": 1, "append": 16}
+
+
+def test_plain_recompute_still_pads_first_decode(runtime):
+    scheduler = make_scheduler(runtime, "RecomputeScheduler")
+    scheduler.num_spec_tokens = 2
+    req = enqueue(runtime, scheduler, marked=False, hits=16)
+    req.num_tokens = req.num_prompt_tokens = 17
+    assert scheduler.schedule().num_scheduled_tokens == {req.request_id: 3}
+
+
+def execute_functions(path, names, namespace):
+    tree = ast.parse(path.read_text())
+    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    assert len(nodes) == len(names)
+    # Exclude heavyweight imports inside platform validation, whose objects
+    # are supplied explicitly by the fixture instead.
+    for node in nodes:
+        node.body = [statement for statement in node.body if not isinstance(statement, (ast.Import, ast.ImportFrom))]
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *nodes],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+
+
+@pytest.mark.parametrize("async_enabled", [False, True])
+@pytest.mark.parametrize("as_type", [False, True, None])
+def test_platform_selects_combination_and_rejects_overriding_policies(async_enabled, as_type):
+    ns = {"logger": Mock(), "_validate_kv_load_failure_policy": lambda config: None}
+    ns["RecomputeSchedulerConfig"] = SimpleNamespace(
+        initialize_from_config=lambda config: SimpleNamespace(**vars(config.scheduler_config))
+    )
+    execute_functions(
+        ROOT / "vllm_ascend/platform.py",
+        {
+            "_is_decoder_append_prefill_scheduler",
+            "_get_recompute_scheduler_cls",
+            "_check_ascend_config",
+            "_select_decoder_append_prefill_scheduler",
+        },
+        ns,
+    )
+    name = "AsyncDecoderAppendPrefillScheduler" if async_enabled else "DecoderAppendPrefillScheduler"
+    module = "vllm_ascend.core.decoder_append_prefill_scheduler"
+    selected = type(name, (), {"__module__": module}) if as_type else f"{module}.{name}"
+    if as_type is None:
+        selected = None
+    config = SimpleNamespace(
+        additional_config={},
+        kv_transfer_config=SimpleNamespace(kv_role="kv_consumer"),
+        scheduler_config=SimpleNamespace(scheduler_cls=selected, async_scheduling=async_enabled),
+    )
+    policies = SimpleNamespace(
+        enable_balance_scheduling=False,
+        recompute_scheduler_enable=True,
+        **{
+            key: SimpleNamespace(enabled=False)
+            for key in (
+                "dyntra_lb_config",
+                "short_request_first_config",
+                "profiling_chunk_config",
+                "batch_job_sched_config",
+            )
+        },
+    )
+    ns["_check_ascend_config"](config, SimpleNamespace(scheduler_config=policies))
+    assert config.scheduler_config.scheduler_cls.endswith(
+        ".AsyncDecoderAppendPrefillRecomputeScheduler" if async_enabled else ".DecoderAppendPrefillRecomputeScheduler"
+    )
+    for key in ("dyntra_lb_config", "profiling_chunk_config", "batch_job_sched_config"):
+        getattr(policies, key).enabled = True
+        with pytest.raises(ValueError, match="incompatible"):
+            ns["_check_ascend_config"](config, SimpleNamespace(scheduler_config=policies))
+        getattr(policies, key).enabled = False
+    config.kv_transfer_config.kv_role = "kv_both"
+    with pytest.raises(ValueError, match="D nodes"):
+        ns["_check_ascend_config"](config, SimpleNamespace(scheduler_config=policies))
+
+
+def test_multi_connector_reports_actual_recovery_state():
+    ns = {"MultiConnector": type("MultiConnector", (), {}), "SupportsHMA": type("SupportsHMA", (), {})}
+    execute_classes(
+        ROOT / "vllm_ascend/distributed/kv_transfer/ascend_multi_connector.py", {"AscendMultiConnector"}, ns
+    )
+    connector = ns["AscendMultiConnector"].__new__(ns["AscendMultiConnector"])
+    state = {"A"}
+    connector._connectors = [object(), SimpleNamespace(has_preempted_request=lambda req_id: req_id in state)]
+    assert connector.has_preempted_request("A")
+    assert not connector.has_preempted_request("B")
+    state.clear()
+    assert not connector.has_preempted_request("A")
+
+
+@pytest.fixture
+def cache_runtime():
+    """Load real CPU block-pool/offload logic without importing torch/NPU."""
+    import contextlib
+    import itertools
+    from collections.abc import Sequence
+    from dataclasses import dataclass, field
+
+    ns = dict(
+        __name__=__name__,
+        dataclass=dataclass,
+        field=field,
+        ABC=ABC,
+        abstractmethod=abstractmethod,
+        logger=Mock(),
+        MEDIUM_GPU="GPU",
+        BlockHash=bytes,
+        BlockHashWithGroupId=bytes,
+        defaultdict=defaultdict,
+        contextlib=contextlib,
+        itertools=itertools,
+        Sequence=Sequence,
+        cdiv=lambda a, b: (a + b - 1) // b,
+        FullAttentionSpec=type("FullAttentionSpec", (), {}),
+        ChunkedLocalAttentionSpec=type("ChunkedLocalAttentionSpec", (), {}),
+    )
+    utils = VLLM / "v1/core/kv_cache_utils.py"
+    execute_classes(utils, {"KVCacheBlock", "FreeKVCacheBlockQueue"}, ns)
+    execute_functions(utils, {"make_block_hash_with_group_id", "get_block_hash", "resolve_block_hashes"}, ns)
+    execute_classes(VLLM / "v1/core/block_pool.py", {"BlockHashToBlockMap", "BlockPool"}, ns)
+    execute_classes(
+        VLLM / "v1/core/single_type_kv_cache_manager.py", {"SingleTypeKVCacheManager", "FullAttentionManager"}, ns
+    )
+    execute_classes(
+        ROOT / "vllm_ascend/distributed/kv_transfer/kv_pool/kv_offload/preempt_offload/manager.py",
+        {"TransferMeta", "PreemptedRequestState", "PreemptOffloadScheduler"},
+        ns,
+    )
+    return SimpleNamespace(**ns)
+
+
+@pytest.mark.parametrize("evict_before_b", [False, True])
+def test_restored_a_finishes_and_b_reuses_new_npu_blocks(runtime, combined, cache_runtime, evict_before_b):
+    """Exercise real offload metadata, hash registration and eviction; no device I/O."""
+    cr = cache_runtime
+    pool = cr.BlockPool(6, enable_caching=True, hash_block_size=16)
+    cpu_pool = cr.BlockPool(6, enable_caching=True, hash_block_size=16)
+    req = enqueue(runtime, combined, "A", hits=16)
+    req.block_hashes = [b"prefix-0", b"prefix-1"]
+    req.num_tokens = req.num_prompt_tokens = 33
+    old = pool.get_new_blocks(2)
+    pool.cache_full_blocks(req, old, 0, 2, 16, 0)
+    manager = cr.PreemptOffloadScheduler.__new__(cr.PreemptOffloadScheduler)
+    spec = cr.FullAttentionSpec()
+    spec.block_size = 16
+    manager.__dict__.update(
+        _gpu_block_pool=pool,
+        cpu_block_pool=cpu_pool,
+        enable_offload_prefix_caching=True,
+        cpu_kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]),
+        _group_is_mamba=[False],
+        _group_is_sliding_window=[False],
+        num_spec_tokens=0,
+        _preempted_req_states={},
+        _pending_hash_blocks={},
+        _preempt_store_event_to_blocks={},
+        _preempt_store_event_to_reqs={},
+        _preempt_load_event_to_reqs={},
+    )
+    tables = {"A": old}
+    combined.kv_cache_manager.free.side_effect = lambda request: pool.free_blocks(tables.pop(request.request_id, []))
+    combined.kv_cache_manager.get_block_ids.side_effect = lambda request_id: ([b.block_id for b in tables[request_id]],)
+    combined.waiting.pop_request()
+    req.status = runtime.RequestStatus.RUNNING
+    req.num_computed_tokens = 32
+    combined.connector = recovery_connector()
+    combined.connector.update_state_before_preempt.side_effect = manager.update_state_before_preempt
+    combined.connector.has_preempted_request.side_effect = manager.has_preempted_request
+    assert combined._preempt_or_recompute(req, 1.0)
+    state = manager._preempted_req_states["A"]
+    # Complete the simulated D2H event before allowing the source to be reused.
+    manager._preempt_store_event_to_blocks[0] = state.store_transfer_meta
+    manager._preempt_store_event_to_reqs[0] = ["A"]
+    manager._process_preempt_store_event(0)
+    assert state.ready
+    unrelated = pool.get_new_blocks(pool.get_num_free_blocks())
+    assert pool.get_cached_block(req.block_hashes[0], [0]) is None
+    # Release different blocks for restore, retaining A's old IDs elsewhere.
+    reusable = [block for block in unrelated if block not in old][:2]
+    pool.free_blocks(reusable)
+    restored = pool.get_new_blocks(2)
+    assert not {b.block_id for b in old} & {b.block_id for b in restored}
+    tables["A"] = restored
+    assert manager.get_num_new_matched_tokens(req, 0) == (32, True)
+    manager.update_state_after_alloc(req, SimpleNamespace(get_block_ids=lambda: ([b.block_id for b in restored],)), 32)
+    assert all(block.ref_cnt == 2 for block in restored)  # Request + H2D hold.
+    state.load_event = 1
+    manager._preempt_load_event_to_reqs[1] = ["A"]
+    manager._cleanup_preempt_load_request("A")
+    assert all(block.ref_cnt == 1 for block in restored)
+    assert not manager.has_preempted_request("A")
+    # Real Scheduler restore path must register the newly allocated NPU blocks.
+    combined.kv_cache_manager.cache_blocks.side_effect = lambda request, tokens: pool.cache_full_blocks(
+        request, tables[request.request_id], 0, tokens // 16, 16, 0
+    )
+    req.status = runtime.RequestStatus.WAITING_FOR_REMOTE_KVS
+    req.num_computed_tokens = 32
+    combined.finished_recving_kv_req_ids = {"A"}
+    combined.failed_recving_kv_req_ids = set()
+    combined._step_decoder_rejections = []
+    combined._update_waiting_for_remote_kv(req)
+    assert pool.get_cached_block(req.block_hashes[0], [0]) == [restored[0]]
+    # Terminal decode output follows the real Scheduler completion path.
+    combined.waiting.pop_request()
+    req.status = runtime.RequestStatus.RUNNING
+    req.resumable = False
+    req.spec_decode_metrics = None
+    req.num_in_flight_tokens = 1
+    req.num_output_placeholders = int(isinstance(combined, runtime.AsyncScheduler))
+    combined.running = [req]
+    # The restored prefix is already registered; subsequent cache calls need
+    # only track full blocks beyond it (none in this one-token completion).
+    combined.kv_cache_manager.cache_blocks.side_effect = None
+    old_check_stop = runtime.Scheduler._update_request_with_output.__globals__["check_stop"]
+
+    def stop(request, max_model_len):
+        request.status = runtime.RequestStatus.FINISHED_STOPPED
+        return True
+
+    runtime.Scheduler._update_request_with_output.__globals__["check_stop"] = stop
+    output = empty_model_output()
+    output.sampled_token_ids = [[42]]
+    output.req_id_to_index = {"A": 0}
+    try:
+        combined.update_from_output(
+            Output(
+                num_scheduled_tokens={"A": 1},
+                total_num_scheduled_tokens=1,
+                recomputed_reqs=None,
+                scheduled_spec_decode_tokens={},
+            ),
+            output,
+        )
+    finally:
+        runtime.Scheduler._update_request_with_output.__globals__["check_stop"] = old_check_stop
+    assert "A" not in combined.requests
+    assert all(block.ref_cnt == 0 for block in restored)
+    if evict_before_b:
+        pool.get_new_blocks(pool.get_num_free_blocks())
+    # B's actual APC lookup traverses real hashes and the real block pool.
+    blocks, hits = cr.FullAttentionManager.find_longest_cache_hit(req.block_hashes, 32, [0], pool, spec, False, 16)
+    assert hits == (0 if evict_before_b else 32)
+    b = enqueue(runtime, combined, "B", hits=hits)
+    combined.kv_cache_manager.get_computed_blocks.return_value = (SimpleNamespace(blocks=blocks), hits, 0)
+    b.num_tokens = b.num_prompt_tokens = 48
+    result = combined.schedule()
+    assert result.num_scheduled_tokens == ({} if evict_before_b else {"B": 16})
+    assert bool(combined._pending_decoder_cache_rejections) == evict_before_b
+
+
+@pytest.mark.parametrize("async_enabled", [False, True])
+def test_combined_constructor_requires_recompute_and_initializes_state(runtime, monkeypatch, async_enabled):
+    policies = SimpleNamespace(
+        enable_balance_scheduling=False,
+        recompute_scheduler_enable=True,
+        **{
+            key: SimpleNamespace(enabled=False)
+            for key in (
+                "dyntra_lb_config",
+                "short_request_first_config",
+                "profiling_chunk_config",
+                "batch_job_sched_config",
+            )
+        },
+    )
+    monkeypatch.setitem(
+        runtime.DecoderCacheAdmissionMixin.__init__.__globals__,
+        "init_ascend_config",
+        lambda config: SimpleNamespace(scheduler_config=policies),
+    )
+
+    def init(self, *args, **kwargs):
+        self.num_spec_tokens = 2
+        self.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+
+    monkeypatch.setattr(runtime.Scheduler, "__init__", init)
+    cls = (
+        runtime.AsyncDecoderAppendPrefillRecomputeScheduler
+        if async_enabled
+        else runtime.DecoderAppendPrefillRecomputeScheduler
+    )
+    config = SimpleNamespace(scheduler_config=SimpleNamespace(async_scheduling=async_enabled))
+    obj = cls(vllm_config=config)
+    assert obj._pending_decoder_cache_rejections == obj._decoder_cache_rejection_batches == {}
+    if async_enabled:
+        assert obj._spec_token_placeholders == [-1, -1]
+    policies.recompute_scheduler_enable = False
+    with pytest.raises(ValueError, match="requires recompute_scheduler_enable"):
+        cls(vllm_config=config)
+
+
+@pytest.mark.parametrize("async_enabled", [False, True])
+@pytest.mark.parametrize("role", [None, "kv_producer", "kv_consumer", "kv_both"])
+@pytest.mark.parametrize(
+    "policy",
+    [
+        None,
+        "custom",
+        "balance",
+        "dyntra_lb_config",
+        "short_request_first_config",
+        "profiling_chunk_config",
+        "batch_job_sched_config",
+    ],
+)
+def test_automatic_admission_selection_preserves_other_schedulers(async_enabled, role, policy):
+    ns = {}
+    execute_functions(
+        ROOT / "vllm_ascend/platform.py",
+        {
+            "_select_decoder_append_prefill_scheduler",
+            "_decoder_append_prefill_capabilities",
+            "_is_decoder_append_prefill_scheduler",
+        },
+        ns,
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role=role),
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
+        scheduler_config=SimpleNamespace(
+            scheduler_cls="custom.Scheduler" if policy == "custom" else None, async_scheduling=async_enabled
+        ),
+    )
+    policies = SimpleNamespace(
+        enable_balance_scheduling=policy == "balance",
+        **{
+            key: SimpleNamespace(enabled=policy == key)
+            for key in (
+                "dyntra_lb_config",
+                "short_request_first_config",
+                "profiling_chunk_config",
+                "batch_job_sched_config",
+            )
+        },
+    )
+    ns["_select_decoder_append_prefill_scheduler"](config, policies)
+    expected = role == "kv_consumer" and policy is None
+    assert ns["_decoder_append_prefill_capabilities"](config)["decoder_cache_admission"] is expected
+    if expected:
+        assert config.scheduler_config.scheduler_cls.endswith(
+            ".AsyncDecoderAppendPrefillScheduler" if async_enabled else ".DecoderAppendPrefillScheduler"
+        )
+    else:
+        assert config.scheduler_config.scheduler_cls == ("custom.Scheduler" if policy == "custom" else None)
+    config.cache_config.enable_prefix_caching = False
+    assert not ns["_decoder_append_prefill_capabilities"](config)["decoder_cache_admission"]
+
+
+@pytest.mark.parametrize("as_type", [False, True])
+def test_recompute_does_not_silently_replace_custom_scheduler(as_type):
+    ns = {}
+    execute_functions(
+        ROOT / "vllm_ascend/platform.py",
+        {"_select_decoder_append_prefill_scheduler", "_is_decoder_append_prefill_scheduler"},
+        ns,
+    )
+    selected = type("Scheduler", (), {"__module__": "custom"}) if as_type else "custom.Scheduler"
+    config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role="kv_consumer"),
+        scheduler_config=SimpleNamespace(scheduler_cls=selected),
+    )
+    with pytest.raises(ValueError, match="explicit custom scheduler_cls"):
+        ns["_select_decoder_append_prefill_scheduler"](config, SimpleNamespace(recompute_scheduler_enable=True))
+    assert config.scheduler_config.scheduler_cls is selected

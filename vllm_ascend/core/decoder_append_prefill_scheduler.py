@@ -13,6 +13,13 @@ same scheduling iteration. The only deltas are per-step rejection bookkeeping,
 skipping pending rejections, the admission guard, and bypassing remote prefix
 matching for marked requests. Keep the drift test aligned when updating it.
 
+DyntraLB is currently unsupported: it requires Decoder instances to execute
+decode-only work, while this scheduler also executes append-prefill on Decoders.
+Recompute variants share admission here and reuse RecomputeScheduler.schedule().
+A preempted request with live offload state can restore its own KV without a
+new local cache hit. Failed recovery preserves the no-replay-after-output
+contract. First-decode padding is disabled for the combination because a batch
+may contain append-prefill; speculative decoding itself remains enabled.
 Other Ascend scheduler policies are not composed here. This module does not
 install global patches or change the API server's terminal-event handling.
 """
@@ -34,26 +41,37 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.ascend_config import init_ascend_config
+from vllm_ascend.core.recompute_scheduler import RecomputeScheduler
 
 logger = init_logger(__name__)
 
 
-class DecoderAppendPrefillScheduler(Scheduler):
-    """Reject decoder-local cache misses without scheduling their prefill."""
+class DecoderCacheAdmissionMixin:
+    """Shared local admission and batch-scoped terminal output handling."""
+
+    _supports_recompute = False
 
     def __init__(self, *args, **kwargs) -> None:
         vllm_config = kwargs.get("vllm_config") if "vllm_config" in kwargs else args[0]
         config = init_ascend_config(vllm_config).scheduler_config
         enabled = {
             "balance": config.enable_balance_scheduling,
-            "recompute": config.recompute_scheduler_enable,
+            "recompute": config.recompute_scheduler_enable and not self._supports_recompute,
             "short_request_first": config.short_request_first_config.enabled,
             "profiling_chunk": config.profiling_chunk_config.enabled,
             "batch_job": config.batch_job_sched_config.enabled,
             "dyntra_lb": config.dyntra_lb_config.enabled,
         }
         if conflicts := [name for name, active in enabled.items() if active]:
-            raise ValueError("Decoder cache admission has no combined scheduler for: " + ", ".join(conflicts))
+            message = "Decoder cache admission has no combined scheduler for: " + ", ".join(conflicts)
+            if "dyntra_lb" in conflicts:
+                message += (
+                    ". DyntraLB is currently unsupported: it requires decode-only Decoder instances, "
+                    "but decoder append-prefill schedules prefill work on Decoders."
+                )
+            raise ValueError(message)
+        if self._supports_recompute and not config.recompute_scheduler_enable:
+            raise ValueError("The combined scheduler requires recompute_scheduler_enable.")
         if bool(vllm_config.scheduler_config.async_scheduling) != isinstance(self, AsyncScheduler):
             raise ValueError("Select the decoder cache admission class matching async_scheduling.")
         super().__init__(*args, **kwargs)
@@ -122,6 +140,10 @@ class DecoderAppendPrefillScheduler(Scheduler):
         for client_index, rejected_outputs in rejections.items():
             outputs.setdefault(client_index, EngineCoreOutputs()).outputs.extend(rejected_outputs)
         return outputs
+
+
+class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
+    """Reject decoder-local cache misses without scheduling their prefill."""
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         rejected_requests: list[Request] = []
@@ -1005,3 +1027,66 @@ class DecoderAppendPrefillScheduler(Scheduler):
 
 class AsyncDecoderAppendPrefillScheduler(AsyncScheduler, DecoderAppendPrefillScheduler):
     """Admission with upstream async placeholders and stale-output handling."""
+
+
+class DecoderAppendPrefillRecomputeScheduler(DecoderCacheAdmissionMixin, RecomputeScheduler):
+    """Apply admission to new requests and preserve same-request KV restore."""
+
+    _supports_recompute = True
+    _allow_decode_padding = False
+
+    def _is_restoring_decoder_request(self, request: Request) -> bool:
+        has_state = getattr(self.connector, "has_preempted_request", None)
+        return bool(request.num_preemptions and has_state is not None and has_state(request.request_id))
+
+    def _can_admit_waiting_request(self, request: Request) -> bool:
+        return self._pending_decoder_cache_rejections.get(
+            request.request_id
+        ) is not request and super()._can_admit_waiting_request(request)
+
+    def _can_admit_local_prefix(self, request: Request, local_hits: int) -> bool:
+        if self._is_restoring_decoder_request(request):
+            return True
+        if self._should_reject_decoder_cache_miss(request, local_hits):
+            self._pending_decoder_cache_rejections[request.request_id] = request
+            self._step_decoder_rejections.append(request)
+            return False
+        return True
+
+    def _get_admission_replay_tokens(self, request: Request, local_hits: int) -> int:
+        if self._requires_decoder_cache_hit(request):
+            return self._mark_prefix_replay(request, local_hits)
+        return 0
+
+    def _update_waiting_for_remote_kv(self, request: Request) -> None:
+        failed = request.request_id in self.failed_recving_kv_req_ids
+        super()._update_waiting_for_remote_kv(request)
+        if failed and self._requires_decoder_cache_hit(request):
+            # Never turn a failed restore into an implicit local full prefill.
+            self._pending_decoder_cache_rejections[request.request_id] = request
+            self._step_decoder_rejections.append(request)
+
+    def _get_external_prefix_cache_hit(self, request: Request, local_hits: int) -> tuple[int | None, bool]:
+        if self._requires_decoder_cache_hit(request) and not self._is_restoring_decoder_request(request):
+            return 0, False
+        return super()._get_external_prefix_cache_hit(request, local_hits)
+
+    def _finish_recomputed_request(self, request: Request) -> None:
+        if not self._requires_decoder_cache_hit(request):
+            return super()._finish_recomputed_request(request)
+        # The victim was removed from running by Recompute. Preserve it until
+        # this batch completes, so older in-flight output drains before deciding
+        # whether replay is safe. Upstream preemption fences KV block freeing.
+        Scheduler._preempt_request(self, request, time.monotonic(), drop_stale_output=self.requires_kv_delivery)
+        self._pending_decoder_cache_rejections[request.request_id] = request
+        self._step_decoder_rejections.append(request)
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        self._step_decoder_rejections: list[Request] = []
+        output = super().schedule(throttle_prefills)
+        self._record_decoder_cache_rejections(output, self._step_decoder_rejections)
+        return output
+
+
+class AsyncDecoderAppendPrefillRecomputeScheduler(AsyncScheduler, DecoderAppendPrefillRecomputeScheduler):
+    pass

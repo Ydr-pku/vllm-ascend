@@ -94,10 +94,10 @@ def test_decoder_local_request_has_symmetric_load_accounting():
 
 
 @pytest.mark.asyncio
-async def test_auto_mode_routes_warm_session_to_pinned_decoder(monkeypatch):
+async def test_enabled_routes_warm_session_to_pinned_decoder(monkeypatch):
     scheduler = make_scheduler()
     decoder_key = bind_and_finish_first_turn(scheduler)
-    args = argparse.Namespace(decoder_append_routing_mode="auto", session_affinity_ttl=60.0)
+    args = argparse.Namespace(enable_decoder_append_prefill=True, session_affinity_ttl=60.0)
     monkeypatch.setattr(proxy, "global_args", args)
     monkeypatch.setattr(proxy, "runtime", proxy.WorkerRuntime(scheduler))
 
@@ -112,28 +112,28 @@ async def test_auto_mode_routes_warm_session_to_pinned_decoder(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_explicit_mode_defaults_warm_session_to_pinned_pd(monkeypatch):
+async def test_enabled_routes_body_session_to_pinned_decoder(monkeypatch):
     scheduler = make_scheduler()
     decoder_key = bind_and_finish_first_turn(scheduler)
-    args = argparse.Namespace(decoder_append_routing_mode="explicit", session_affinity_ttl=60.0)
+    args = argparse.Namespace(enable_decoder_append_prefill=True, session_affinity_ttl=60.0)
     monkeypatch.setattr(proxy, "global_args", args)
     monkeypatch.setattr(proxy, "runtime", proxy.WorkerRuntime(scheduler))
 
     req_data = {"prompt": "complete prompt", "conversation_id": "session-1"}
     route = await proxy.plan_request_route(FakeRequest(), req_data)
 
-    assert route.mode is proxy.RouteMode.PD
-    assert route.reason == "warm_pd"
+    assert route.mode is proxy.RouteMode.DECODER_LOCAL
+    assert route.reason == "affinity_hit"
     assert route.pinned_decoder_key == decoder_key
     assert "conversation_id" not in req_data
     scheduler.finish_session("session-1", False)
 
 
 @pytest.mark.asyncio
-async def test_explicit_decoder_local_header(monkeypatch):
+async def test_disabled_ignores_legacy_decoder_local_header(monkeypatch):
     scheduler = make_scheduler()
-    decoder_key = bind_and_finish_first_turn(scheduler)
-    args = argparse.Namespace(decoder_append_routing_mode="explicit", session_affinity_ttl=60.0)
+    bind_and_finish_first_turn(scheduler)
+    args = argparse.Namespace(enable_decoder_append_prefill=False, session_affinity_ttl=60.0)
     monkeypatch.setattr(proxy, "global_args", args)
     monkeypatch.setattr(proxy, "runtime", proxy.WorkerRuntime(scheduler))
 
@@ -141,14 +141,14 @@ async def test_explicit_decoder_local_header(monkeypatch):
         FakeRequest(
             {
                 proxy.SESSION_ID_HEADER: "session-1",
-                proxy.REQUEST_MODE_HEADER: "decoder-local",
+                "X-vLLM-Request-Mode": "decoder-local",
             }
         ),
         {"prompt": "complete prompt"},
     )
 
-    assert route.mode is proxy.RouteMode.DECODER_LOCAL
-    assert route.pinned_decoder_key == decoder_key
+    assert route.mode is proxy.RouteMode.PD
+    assert route.pinned_decoder_key is None
     scheduler.finish_session("session-1", False)
 
 
@@ -200,18 +200,20 @@ def test_rank_validation_has_no_load_side_effect():
 
 
 @pytest.mark.asyncio
-async def test_off_mode_cleans_proxy_fields_and_stale_metadata(monkeypatch):
-    monkeypatch.setattr(proxy, "global_args", argparse.Namespace(decoder_append_routing_mode="off"))
+async def test_disabled_cleans_proxy_fields_and_stale_metadata(monkeypatch):
+    monkeypatch.setattr(proxy, "global_args", argparse.Namespace(enable_decoder_append_prefill=False))
     body = {"conversation_id": "session", "kv_transfer_params": {"stale": True}, "prompt": "hello"}
     route = await proxy.plan_request_route(FakeRequest(), body)
     assert route.reason == "feature_disabled"
     assert body == {"prompt": "hello"}
 
 
-def install_mock_backends(monkeypatch, scheduler, mode="explicit"):
+def install_mock_backends(monkeypatch, scheduler, enabled=True):
     seen = []
 
     def backend(request):
+        if request.url.path == "/v1/decoder_append_prefill/capabilities":
+            return httpx.Response(200, json={"protocol_version": 1, "decoder_cache_admission": True})
         body = json.loads(request.content)
         seen.append((request.url.port, dict(request.headers), body))
         result = {
@@ -240,7 +242,7 @@ def install_mock_backends(monkeypatch, scheduler, mode="explicit"):
         proxy,
         "global_args",
         argparse.Namespace(
-            decoder_append_routing_mode=mode,
+            enable_decoder_append_prefill=enabled,
             session_affinity_ttl=60.0,
             max_retries=1,
             retry_delay=0.0,
@@ -256,7 +258,7 @@ async def consume_proxy_response(request):
 
 
 @pytest.mark.asyncio
-async def test_cold_warm_pd_and_local_send_only_trusted_decoder_rank(monkeypatch):
+async def test_cold_and_warm_local_send_only_trusted_decoder_rank(monkeypatch):
     scheduler = make_dp4_scheduler()
     runtime, seen = install_mock_backends(monkeypatch, scheduler)
     session_headers = {"X-Session-ID": "experiment-session", "X-data-parallel-rank": "99"}
@@ -271,11 +273,9 @@ async def test_cold_warm_pd_and_local_send_only_trusted_decoder_rank(monkeypatch
         assert cold.headers["X-Decoder-DP-Rank"] == "0"
         assert cold.headers["X-Decoder-Engine-Epoch"] == "decoder-test-epoch"
         assert cold_body["usage"]["prompt_tokens_details"]["cached_tokens"] == 128
-        warm_pd, _ = await consume_proxy_response(FakeRequest(session_headers, payload))
-        assert warm_pd.headers["X-Proxy-Route-Reason"] == "warm_pd"
         warm_local, local_body = await consume_proxy_response(
             FakeRequest(
-                {**session_headers, "X-vLLM-Request-Mode": "decoder-local"},
+                {**session_headers},
                 payload,
             )
         )
@@ -285,7 +285,7 @@ async def test_cold_warm_pd_and_local_send_only_trusted_decoder_rank(monkeypatch
         assert local_body["proxy_metrics"]["final_route"] == "decoder_local"
         assert local_body["proxy_metrics"]["recovered"] is False
         assert local_body["proxy_metrics"]["cached_tokens_source"] == "decoder"
-        assert [port for port, _, _ in seen] == [8100, 8200, 8100, 8200, 8200]
+        assert [port for port, _, _ in seen] == [8100, 8200, 8200]
         for port, headers, body in seen:
             assert "conversation_id" not in body
             if port == 8100:
@@ -351,7 +351,7 @@ async def test_decoder_local_stream_preserves_empty_choice_usage_chunk(monkeypat
         response = await proxy.handle_completions_impl(
             "/completions",
             FakeRequest(
-                {"X-Session-ID": "stream-session", "X-vLLM-Request-Mode": "decoder-local"},
+                {"X-Session-ID": "stream-session"},
                 {"prompt": "prefix and append", "stream": True, "stream_options": {"include_usage": True}},
             ),
         )
@@ -376,6 +376,8 @@ async def test_decoder_local_recovery_reports_final_pd_route_and_cache_source(mo
         decoder_calls = []
 
         def backend(request):
+            if request.url.path == "/v1/decoder_append_prefill/capabilities":
+                return httpx.Response(200, json={"protocol_version": 1, "decoder_cache_admission": True})
             decoder_calls.append(request)
             recomputed = len(decoder_calls) == 1
             return httpx.Response(
@@ -397,7 +399,7 @@ async def test_decoder_local_recovery_reports_final_pd_route_and_cache_source(mo
         )
         response, body = await consume_proxy_response(
             FakeRequest(
-                {"X-Session-ID": "recover-session", "X-vLLM-Request-Mode": "decoder-local"},
+                {"X-Session-ID": "recover-session"},
             )
         )
         assert response.headers["X-Proxy-Route"] == "decoder_local"
@@ -447,18 +449,20 @@ async def test_fail_closed_nonstream_recomputed_returns_502_without_p_retry(monk
         runtime._clients[proxy.ServerRole.DECODE][decoder_key] = httpx.AsyncClient(
             base_url="http://127.0.0.1:8200/v1",
             transport=httpx.MockTransport(
-                lambda _: httpx.Response(
+                lambda request: httpx.Response(
                     200,
-                    json={
-                        "choices": [{"text": "", "stop_reason": "recomputed"}],
-                    },
+                    json=(
+                        {"protocol_version": 1, "decoder_cache_admission": True}
+                        if request.method == "GET"
+                        else {"choices": [{"text": "", "stop_reason": "recomputed"}]}
+                    ),
                 )
             ),
         )
         response = await proxy.handle_completions_impl(
             "/completions",
             FakeRequest(
-                {"X-Session-ID": "fail-session", "X-vLLM-Request-Mode": "decoder-local"},
+                {"X-Session-ID": "fail-session"},
             ),
         )
         assert response.status_code == 502
@@ -491,6 +495,8 @@ async def test_partial_stream_failure_propagates_and_never_retries():
     requests = []
 
     def backend(request):
+        if request.url.path == "/v1/decoder_append_prefill/capabilities":
+            return httpx.Response(200, json={"protocol_version": 1, "decoder_cache_admission": True})
         requests.append(request)
         return httpx.Response(200, stream=InterruptedStream())
 
@@ -539,6 +545,8 @@ async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stre
     original = copy.deepcopy(payload)
 
     def backend(request):
+        if request.url.path == "/v1/decoder_append_prefill/capabilities":
+            return httpx.Response(200, json={"protocol_version": 1, "decoder_cache_admission": True})
         body = json.loads(request.content)
         seen.append((request.url.port, dict(request.headers), body))
         miss = len(seen) == 1
@@ -585,7 +593,7 @@ async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stre
     try:
         response = await proxy.handle_completions_impl(
             "/chat/completions" if chat else "/completions",
-            FakeRequest({"X-Session-ID": "session-1", "X-vLLM-Request-Mode": "decoder-local"}, payload),
+            FakeRequest({"X-Session-ID": "session-1"}, payload),
         )
         chunks = [chunk async for chunk in response.body_iterator]
         result = json.loads(chunks[0][6:] if stream else chunks[0])
@@ -645,7 +653,7 @@ async def test_miss_after_any_output_never_replays(monkeypatch, prior):
         response = await proxy.handle_completions_impl(
             "/completions",
             FakeRequest(
-                {"X-Session-ID": "session-1", "X-vLLM-Request-Mode": "decoder-local"},
+                {"X-Session-ID": "session-1"},
                 {"prompt": [1, 2], "stream": True},
             ),
         )
@@ -669,6 +677,8 @@ async def test_failed_fallback_never_sends_unprefilled_request_to_d(monkeypatch,
     seen = []
 
     def backend(request):
+        if request.url.path == "/v1/decoder_append_prefill/capabilities":
+            return httpx.Response(200, json={"protocol_version": 1, "decoder_cache_admission": True})
         seen.append(request.url.port)
         # P intentionally violates the transfer contract. D must not be called again.
         result = {"choices": [{"text": "", "stop_reason": reason}]}
@@ -684,9 +694,7 @@ async def test_failed_fallback_never_sends_unprefilled_request_to_d(monkeypatch,
                 base_url=proxy.build_base_url(server.host, server.port), transport=httpx.MockTransport(backend)
             )
     try:
-        response = await proxy.handle_completions_impl(
-            "/completions", FakeRequest({"X-Session-ID": "session-1", "X-vLLM-Request-Mode": "decoder-local"})
-        )
+        response = await proxy.handle_completions_impl("/completions", FakeRequest({"X-Session-ID": "session-1"}))
         chunks = [c async for c in response.body_iterator]
         error = json.loads(b"".join(chunks))["error"]["code"]
         if reason == "decoder_cache_miss":
@@ -714,6 +722,8 @@ async def test_admission_fallback_failure_returns_error_and_releases_once(monkey
     seen = []
 
     def backend(request):
+        if request.url.path == "/v1/decoder_append_prefill/capabilities":
+            return httpx.Response(200, json={"protocol_version": 1, "decoder_cache_admission": True})
         seen.append(request.url.port)
         if request.url.port == 8100:
             return httpx.Response(503, json={"error": "injected P unavailable"})
@@ -737,7 +747,7 @@ async def test_admission_fallback_failure_returns_error_and_releases_once(monkey
         response = await proxy.handle_completions_impl(
             "/completions",
             FakeRequest(
-                {"X-Session-ID": "session-1", "X-vLLM-Request-Mode": "decoder-local"},
+                {"X-Session-ID": "session-1"},
                 {"prompt": [7, 9, 11], "max_tokens": 16, "stream": stream},
             ),
         )
@@ -876,6 +886,8 @@ async def test_incomplete_event_then_disconnect_never_retries():
             raise httpx.ReadError("injected interruption")
 
     def backend(request):
+        if request.url.path == "/v1/decoder_append_prefill/capabilities":
+            return httpx.Response(200, json={"protocol_version": 1, "decoder_cache_admission": True})
         calls.append(request)
         return httpx.Response(200, stream=InterruptedPartialEvent())
 
@@ -904,6 +916,8 @@ async def test_broken_stream_reports_failure_and_releases_session(monkeypatch, t
             closed.append(True)
 
     def backend(request):
+        if request.url.path == "/v1/decoder_append_prefill/capabilities":
+            return httpx.Response(200, json={"protocol_version": 1, "decoder_cache_admission": True})
         calls.append(request)
         return httpx.Response(200, stream=BrokenStream())
 
@@ -916,7 +930,7 @@ async def test_broken_stream_reports_failure_and_releases_session(monkeypatch, t
         response = await proxy.handle_completions_impl(
             "/completions",
             FakeRequest(
-                {"X-Session-ID": "session-1", "X-vLLM-Request-Mode": "decoder-local"},
+                {"X-Session-ID": "session-1"},
                 {"prompt": [1, 2, 3], "max_tokens": 4, "stream": True},
             ),
         )
@@ -931,3 +945,124 @@ async def test_broken_stream_reports_failure_and_releases_session(monkeypatch, t
         assert all(server.active_tokens == 0 for server in scheduler.decoders.values())
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload,status",
+    [
+        ({"protocol_version": 1, "decoder_cache_admission": False}, 200),
+        ({"protocol_version": 2, "decoder_cache_admission": True}, 200),
+        ({"protocol_version": 1, "decoder_cache_admission": "true"}, 200),
+        ([], 200),
+        ({}, 404),
+        ({}, 503),
+    ],
+)
+async def test_unsupported_decoder_fails_before_dispatch_and_releases_session(monkeypatch, payload, status):
+    scheduler = make_dp4_scheduler()
+    runtime, seen = install_mock_backends(monkeypatch, scheduler)
+    try:
+        await consume_proxy_response(FakeRequest({"X-Session-ID": "capability-session"}))
+        key = next(iter(scheduler.decoders))
+        await runtime._clients[proxy.ServerRole.DECODE][key].aclose()
+        requests = []
+
+        def backend(request):
+            requests.append(request)
+            return httpx.Response(status, json=payload)
+
+        runtime._clients[proxy.ServerRole.DECODE][key] = httpx.AsyncClient(
+            base_url="http://127.0.0.1:8200/v1", transport=httpx.MockTransport(backend)
+        )
+        response = await proxy.handle_completions_impl(
+            "/completions", FakeRequest({"X-Session-ID": "capability-session"})
+        )
+        assert response.status_code == 502
+        assert len(seen) == 2
+        assert len(requests) == 1
+        assert requests[0].url.path == "/v1/decoder_append_prefill/capabilities"
+        assert scheduler.healthcheck()["request_num"] == 0
+        assert scheduler.healthcheck()["in_flight_sessions"] == 0
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_startup_checks_capability_only_when_enabled_and_closes_on_failure(monkeypatch, enabled):
+    scheduler = make_dp4_scheduler()
+    runtime, _ = install_mock_backends(monkeypatch, scheduler, enabled=enabled)
+    proxy.global_args.workers = 1
+    monkeypatch.setattr(proxy, "_ensure_scheduler", lambda _: scheduler)
+    monkeypatch.setattr(proxy, "WorkerRuntime", lambda _: runtime)
+    calls = []
+
+    async def unsupported(key):
+        calls.append(key)
+        raise proxy.BackendContractError("unsupported", code="unsupported_decoder_admission")
+
+    monkeypatch.setattr(runtime, "check_decoder_admission", unsupported)
+    if enabled:
+        with pytest.raises(proxy.BackendContractError):
+            async with proxy.lifespan(proxy.app):
+                pytest.fail("startup must fail for an unsupported decoder")
+        assert calls == list(scheduler.decoders)
+    else:
+        async with proxy.lifespan(proxy.app):
+            assert not calls
+    assert proxy.runtime is None
+    assert all(not clients for clients in runtime._clients.values())
+
+
+def test_proxy_cli_has_only_boolean_append_switch(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["proxy"])
+    assert proxy.parse_args().enable_decoder_append_prefill is False
+    monkeypatch.setattr(sys, "argv", ["proxy", "--enable-decoder-append-prefill"])
+    assert proxy.parse_args().enable_decoder_append_prefill is True
+    monkeypatch.setattr(sys, "argv", ["proxy", "--decoder-append-routing-mode", "auto"])
+    with pytest.raises(SystemExit):
+        proxy.parse_args()
+
+
+@pytest.mark.asyncio
+async def test_capability_endpoint_uses_resolved_server_config(monkeypatch):
+    from types import ModuleType
+
+    from fastapi import APIRouter, FastAPI
+
+    root = Path(__file__).resolve().parents[3]
+    import ast
+
+    platform_ns = {}
+    tree = ast.parse((root / "vllm_ascend/platform.py").read_text())
+    nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_decoder_append_prefill_capabilities", "_is_decoder_append_prefill_scheduler"}
+    ]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "platform_capability", "exec"), platform_ns)
+    platform_module = ModuleType("vllm_ascend.platform")
+    platform_module._decoder_append_prefill_capabilities = platform_ns["_decoder_append_prefill_capabilities"]
+    health_module = ModuleType("vllm.entrypoints.serve.instrumentator.health")
+    health_module.router = APIRouter()
+    monkeypatch.setitem(sys.modules, platform_module.__name__, platform_module)
+    monkeypatch.setitem(sys.modules, health_module.__name__, health_module)
+    patch = root / "vllm_ascend/patch/platform/patch_decoder_append_prefill.py"
+    exec(compile(patch.read_text(), str(patch), "exec"), {})
+    app = FastAPI()
+    app.include_router(health_module.router)
+    app.state.vllm_config = argparse.Namespace(
+        kv_transfer_config=argparse.Namespace(kv_role="kv_consumer"),
+        cache_config=argparse.Namespace(enable_prefix_caching=True),
+        scheduler_config=argparse.Namespace(
+            scheduler_cls="vllm_ascend.core.decoder_append_prefill_scheduler.DecoderAppendPrefillScheduler"
+        ),
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/v1/decoder_append_prefill/capabilities")
+        assert response.json() == {"protocol_version": 1, "decoder_cache_admission": True}
+        app.state.vllm_config.scheduler_config.scheduler_cls = "custom.Scheduler"
+        response = await client.get("/v1/decoder_append_prefill/capabilities")
+        assert response.json() == {"protocol_version": 1, "decoder_cache_admission": False}

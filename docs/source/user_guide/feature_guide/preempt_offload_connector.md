@@ -279,6 +279,71 @@ allocated for the resumed request.
 * If CPU memory capacity is insufficient, the connector skips offload for that
   request and the scheduler falls back to the original recompute behavior.
 
+## Decoder-local Append-Prefill
+
+To combine preempt offload with decoder-local append-prefill, enable prefix
+caching on the Decode service and set the existing `recompute_scheduler_enable`:
+
+```bash
+--enable-prefix-caching \
+--additional-config '{"scheduler_config":{"recompute_scheduler_enable":true}}'
+```
+
+Keep the Decode node's `kv_consumer` and MultiConnector configuration above.
+The platform selects `DecoderAppendPrefillRecomputeScheduler`, or
+`AsyncDecoderAppendPrefillRecomputeScheduler` when async scheduling is enabled.
+Both classes live in
+`vllm_ascend.core.decoder_append_prefill_scheduler`. No manual `--scheduler-cls`
+or backend append-prefill switch is needed. Without Recompute, supported D nodes
+automatically use the corresponding sync/async `DecoderAppendPrefillScheduler`.
+Custom and unsupported scheduler policies are not replaced by this selection.
+
+Use `examples/disaggregated_prefill_v1/decoder_append_prefill_proxy_server.py`
+with `--enable-decoder-append-prefill` and a stable `X-Session-ID` header (or
+`conversation_id` in the request body). This is the only append-prefill switch:
+without it every request uses normal P/D; with it cold sessions use P/D and warm
+sessions use their pinned Decoder, falling back to P/D on cache miss. No request
+mode header is needed. The Recompute switch remains independent.
+
+The proxy checks `/v1/decoder_append_prefill/capabilities` on all Decoders at
+startup and again before each local dispatch, including dynamically added nodes.
+Unsupported schedulers, disabled prefix caching, or an unavailable capability
+endpoint cause an error before local inference. The check advertises Scheduler
+admission only; it does not verify streaming terminal-event compatibility.
+
+A new request marked with
+`vllm_xargs.require_decoder_cache_hit=1` must have a usable NPU-local prefix.
+A miss terminates with `decoder_cache_miss` before any prefill is scheduled,
+allowing the proxy to retry the original request through P/D. The API server
+must preserve zero-token terminal events in streaming responses; selecting
+this scheduler does not install that serving compatibility change.
+
+A preempted request with its own offload state may instead wait for D2H and
+restore through the connector, even when its NPU-local prefix has been evicted.
+This is recovery of the same request, not admission of a later session turn.
+Once restored, its blocks enter normal prefix caching. Completion releases
+request references without pinning the session's cache: the next turn can hit
+those blocks only while they remain resident on the same Decoder owner.
+
+If offload is unavailable or restore fails, marked requests terminate with
+`decoder_cache_miss` before output, or `decoder_cache_lost_after_output` after
+output. The latter must not be replayed. Ordinary unmarked P/D requests retain
+Recompute's `recomputed` protocol. Connector failures configured to fail the
+request immediately retain the upstream error path.
+
+The combination disables Recompute's first-decode speculative padding
+optimization for all batches, including decode-only batches, to avoid assuming
+that append-prefill cannot enter the batch. Speculative decoding itself remains
+enabled. The latency and graph-execution impact needs NPU validation.
+DyntraLB remains unsupported because it requires decode-only Decoder work;
+balance, short-request-first, profiling-chunk and batch-job policies are also
+rejected for this combination.
+
+CPU regressions cover sync/async admission, restore waiting and failure,
+in-flight output ordering, mixed-batch padding, and real block-pool reuse from
+request A to the next request B after restore. These tests simulate device I/O;
+they do not establish NPU transfer correctness, model accuracy or performance.
+
 ## FAQ
 
 ### How much CPU memory should I configure?

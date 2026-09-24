@@ -1562,3 +1562,10 @@
 #       it after verifying PCP+DP construction and execution, retained invalid-
 #       config rejection, and Ascend EPLB validation.
 #
+
+# ** File: platform/patch_decoder_append_prefill.py **
+# Target: vllm.entrypoints.serve.instrumentator.health.router
+# Why: verify Scheduler cache admission before the proxy routes warm turns.
+# How: expose a minimal authenticated capability endpoint from resolved config.
+# Related PR: no upstream equivalent exists for this Ascend-specific protocol.
+# Future Plan: migrate to an upstream scheduler-capability API when available.

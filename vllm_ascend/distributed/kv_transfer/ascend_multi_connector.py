@@ -178,6 +178,14 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
 
         return super().get_num_new_matched_tokens(request, num_computed_tokens)
 
+    def has_preempted_request(self, request_id: str) -> bool:
+        """Whether a child owns request-local KV recovery state."""
+        return any(
+            hook(request_id)
+            for connector in self._connectors
+            if (hook := getattr(connector, "has_preempted_request", None)) is not None
+        )
+
     def update_state_before_preempt(
         self,
         request: "Request",
