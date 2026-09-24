@@ -40,7 +40,6 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
-from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.core.recompute_scheduler import RecomputeScheduler
 
 logger = init_logger(__name__)
@@ -49,31 +48,8 @@ logger = init_logger(__name__)
 class DecoderCacheAdmissionMixin:
     """Shared local admission and batch-scoped terminal output handling."""
 
-    _supports_recompute = False
-
     def __init__(self, *args, **kwargs) -> None:
-        vllm_config = kwargs.get("vllm_config") if "vllm_config" in kwargs else args[0]
-        config = init_ascend_config(vllm_config).scheduler_config
-        enabled = {
-            "balance": config.enable_balance_scheduling,
-            "recompute": config.recompute_scheduler_enable and not self._supports_recompute,
-            "short_request_first": config.short_request_first_config.enabled,
-            "profiling_chunk": config.profiling_chunk_config.enabled,
-            "batch_job": config.batch_job_sched_config.enabled,
-            "dyntra_lb": config.dyntra_lb_config.enabled,
-        }
-        if conflicts := [name for name, active in enabled.items() if active]:
-            message = "Decoder cache admission has no combined scheduler for: " + ", ".join(conflicts)
-            if "dyntra_lb" in conflicts:
-                message += (
-                    ". DyntraLB is currently unsupported: it requires decode-only Decoder instances, "
-                    "but decoder append-prefill schedules prefill work on Decoders."
-                )
-            raise ValueError(message)
-        if self._supports_recompute and not config.recompute_scheduler_enable:
-            raise ValueError("The combined scheduler requires recompute_scheduler_enable.")
-        if bool(vllm_config.scheduler_config.async_scheduling) != isinstance(self, AsyncScheduler):
-            raise ValueError("Select the decoder cache admission class matching async_scheduling.")
+        # Scheduler policy compatibility is validated in platform._check_ascend_config.
         super().__init__(*args, **kwargs)
         self._pending_decoder_cache_rejections: dict[str, Request] = {}
         # EngineCore retains this exact SchedulerOutput until update_from_output.
@@ -1032,7 +1008,6 @@ class AsyncDecoderAppendPrefillScheduler(AsyncScheduler, DecoderAppendPrefillSch
 class DecoderAppendPrefillRecomputeScheduler(DecoderCacheAdmissionMixin, RecomputeScheduler):
     """Apply admission to new requests and preserve same-request KV restore."""
 
-    _supports_recompute = True
     _allow_decode_padding = False
 
     def _is_restoring_decoder_request(self, request: Request) -> bool:

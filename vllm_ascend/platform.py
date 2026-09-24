@@ -940,15 +940,8 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
     _select_decoder_append_prefill_scheduler(vllm_config, scheduler_extension_config)
     decoder_append = _is_decoder_append_prefill_scheduler(vllm_config.scheduler_config.scheduler_cls)
     if decoder_append:
-        incompatible = {
-            "balance": scheduler_extension_config.enable_balance_scheduling,
-            "dyntra_lb": scheduler_extension_config.dyntra_lb_config.enabled,
-            "short_request_first": scheduler_extension_config.short_request_first_config.enabled,
-            "profiling_chunk": scheduler_extension_config.profiling_chunk_config.enabled,
-            "batch_job": scheduler_extension_config.batch_job_sched_config.enabled,
-        }
-        if conflicts := [name for name, enabled in incompatible.items() if enabled]:
-            raise ValueError("Decoder append-prefill is incompatible with: " + ", ".join(conflicts))
+        # Fail before automatic scheduler selection can overwrite admission.
+        _validate_decoder_append_prefill_policies(vllm_config, scheduler_extension_config)
 
     # enable_balance_scheduling: only supported in PD-mixed mode
     if scheduler_extension_config.enable_balance_scheduling:
@@ -1479,6 +1472,58 @@ def _prune_reduced_capture_sizes(vllm_config):
         len(original_sizes),
         MAX_REDUCED_CAPTURE_SIZES,
     )
+
+
+def _validate_decoder_append_prefill_policies(vllm_config, config) -> None:
+    """Reject unimplemented policy combinations, not standalone scheduler use.
+
+    This feature targets long-input, short-output agentic requests on
+    PD-disaggregated Decoders. These are current support boundaries, not
+    restrictions on all agentic workloads or on using a proxy in general.
+    """
+    unsupported = (
+        # Balance has no PD-disaggregated P/D implementation.
+        (config.enable_balance_scheduling, "balance", "only supports PD-mixed deployments"),
+        # Append-prefill violates DyntraLB's decode-only execution contract.
+        (
+            config.dyntra_lb_config.enabled,
+            "dyntra_lb",
+            "DyntraLB is currently unsupported: it requires decode-only Decoder instances",
+        ),
+        # P nodes may still use ShortRequestFirst independently.
+        (
+            config.short_request_first_config.enabled,
+            "short_request_first",
+            "supports prefill or PD-mixed nodes, not PD-disaggregated Decoders",
+        ),
+        # Our target Decoders use PP=1; a future PP>1 combination needs its own
+        # admission, chunk-budget and async pipeline validation.
+        (
+            config.profiling_chunk_config.enabled,
+            "profiling_chunk",
+            "requires PP>1; current target Decoders use PP=1 and no append-prefill combination is implemented",
+        ),
+        # BatchJobAware targets throughput-first job grouping, with no
+        # starvation prevention. Defer composition for this agentic workload;
+        # it is not inherently incompatible with online APIs or proxies.
+        (
+            config.batch_job_sched_config.enabled,
+            "batch_job",
+            "BatchJobAware composition is deferred: this feature targets long-input, short-output agentic requests, "
+            "rather than throughput-first batch jobs with job-level decode-length prioritization",
+        ),
+    )
+    conflicts = [f"{name}: {reason}" for enabled, name, reason in unsupported if enabled]
+    if conflicts:
+        raise ValueError(
+            "Decoder append-prefill is incompatible with these currently unsupported policies: " + "; ".join(conflicts)
+        )
+    selected = vllm_config.scheduler_config.scheduler_cls
+    name = selected.__name__ if isinstance(selected, type) else selected.rsplit(".", 1)[-1]
+    if "Recompute" in name and not config.recompute_scheduler_enable:
+        raise ValueError("The combined scheduler requires recompute_scheduler_enable.")
+    if bool(vllm_config.scheduler_config.async_scheduling) != name.startswith("Async"):
+        raise ValueError("Select the decoder cache admission class matching async_scheduling.")
 
 
 def _select_decoder_append_prefill_scheduler(vllm_config, extension_config) -> None:

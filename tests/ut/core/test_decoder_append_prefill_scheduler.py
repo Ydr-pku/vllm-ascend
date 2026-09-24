@@ -437,22 +437,6 @@ def test_only_documented_admission_deltas_change_schedule():
 
 @pytest.mark.parametrize("async_enabled", [False, True])
 def test_constructor_preserves_async_setup(runtime, monkeypatch, async_enabled):
-    policy = SimpleNamespace(
-        enable_balance_scheduling=False,
-        recompute_scheduler_enable=False,
-        **{
-            key: SimpleNamespace(enabled=False)
-            for key in (
-                "short_request_first_config",
-                "profiling_chunk_config",
-                "batch_job_sched_config",
-                "dyntra_lb_config",
-            )
-        },
-    )
-    init_globals = runtime.DecoderAppendPrefillScheduler.__init__.__globals__
-    monkeypatch.setitem(init_globals, "init_ascend_config", lambda config: SimpleNamespace(scheduler_config=policy))
-
     def base_init(self, *args, **kwargs):
         self.num_spec_tokens = 2
         self.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
@@ -465,16 +449,6 @@ def test_constructor_preserves_async_setup(runtime, monkeypatch, async_enabled):
     assert instance._decoder_cache_rejection_batches == {}
     if async_enabled:
         assert instance._spec_token_placeholders == [-1, -1]
-    config.scheduler_config.async_scheduling = not async_enabled
-    with pytest.raises(ValueError, match="matching async_scheduling"):
-        cls(vllm_config=config)
-    policy.dyntra_lb_config.enabled = True
-    with pytest.raises(ValueError, match="DyntraLB is currently unsupported.*decode-only"):
-        cls(vllm_config=config)
-    policy.dyntra_lb_config.enabled = False
-    policy.recompute_scheduler_enable = True
-    with pytest.raises(ValueError, match="recompute"):
-        cls(vllm_config=config)
 
 
 def test_inflight_preempted_output_is_delivered_before_cache_loss(runtime, scheduler):
@@ -664,6 +638,7 @@ def test_platform_selects_combination_and_rejects_overriding_policies(async_enab
             "_is_decoder_append_prefill_scheduler",
             "_get_recompute_scheduler_cls",
             "_check_ascend_config",
+            "_validate_decoder_append_prefill_policies",
             "_select_decoder_append_prefill_scheduler",
         },
         ns,
@@ -695,11 +670,28 @@ def test_platform_selects_combination_and_rejects_overriding_policies(async_enab
     assert config.scheduler_config.scheduler_cls.endswith(
         ".AsyncDecoderAppendPrefillRecomputeScheduler" if async_enabled else ".DecoderAppendPrefillRecomputeScheduler"
     )
-    for key in ("dyntra_lb_config", "profiling_chunk_config", "batch_job_sched_config"):
+    for key, reason in (
+        ("dyntra_lb_config", "decode-only"),
+        ("short_request_first_config", "PD-disaggregated Decoders"),
+        ("profiling_chunk_config", "PP>1"),
+        ("batch_job_sched_config", "long-input, short-output agentic"),
+    ):
         getattr(policies, key).enabled = True
-        with pytest.raises(ValueError, match="incompatible"):
+        with pytest.raises(ValueError, match=reason):
             ns["_check_ascend_config"](config, SimpleNamespace(scheduler_config=policies))
         getattr(policies, key).enabled = False
+    policies.enable_balance_scheduling = True
+    with pytest.raises(ValueError, match="PD-mixed"):
+        ns["_check_ascend_config"](config, SimpleNamespace(scheduler_config=policies))
+    policies.enable_balance_scheduling = False
+    policies.recompute_scheduler_enable = False
+    with pytest.raises(ValueError, match="requires recompute_scheduler_enable"):
+        ns["_check_ascend_config"](config, SimpleNamespace(scheduler_config=policies))
+    policies.recompute_scheduler_enable = True
+    config.scheduler_config.async_scheduling = not async_enabled
+    with pytest.raises(ValueError, match="matching async_scheduling"):
+        ns["_check_ascend_config"](config, SimpleNamespace(scheduler_config=policies))
+    config.scheduler_config.async_scheduling = async_enabled
     config.kv_transfer_config.kv_role = "kv_both"
     with pytest.raises(ValueError, match="D nodes"):
         ns["_check_ascend_config"](config, SimpleNamespace(scheduler_config=policies))
@@ -880,26 +872,7 @@ def test_restored_a_finishes_and_b_reuses_new_npu_blocks(runtime, combined, cach
 
 
 @pytest.mark.parametrize("async_enabled", [False, True])
-def test_combined_constructor_requires_recompute_and_initializes_state(runtime, monkeypatch, async_enabled):
-    policies = SimpleNamespace(
-        enable_balance_scheduling=False,
-        recompute_scheduler_enable=True,
-        **{
-            key: SimpleNamespace(enabled=False)
-            for key in (
-                "dyntra_lb_config",
-                "short_request_first_config",
-                "profiling_chunk_config",
-                "batch_job_sched_config",
-            )
-        },
-    )
-    monkeypatch.setitem(
-        runtime.DecoderCacheAdmissionMixin.__init__.__globals__,
-        "init_ascend_config",
-        lambda config: SimpleNamespace(scheduler_config=policies),
-    )
-
+def test_combined_constructor_initializes_state(runtime, monkeypatch, async_enabled):
     def init(self, *args, **kwargs):
         self.num_spec_tokens = 2
         self.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
@@ -915,9 +888,6 @@ def test_combined_constructor_requires_recompute_and_initializes_state(runtime, 
     assert obj._pending_decoder_cache_rejections == obj._decoder_cache_rejection_batches == {}
     if async_enabled:
         assert obj._spec_token_placeholders == [-1, -1]
-    policies.recompute_scheduler_enable = False
-    with pytest.raises(ValueError, match="requires recompute_scheduler_enable"):
-        cls(vllm_config=config)
 
 
 @pytest.mark.parametrize("async_enabled", [False, True])
