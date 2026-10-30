@@ -531,6 +531,9 @@ class AscendConfig:
                     "bubble_threshold": 5.0,
                     "long_req_block_threshold": 700,
                     "dynamic_max_step": 256
+                },
+                "decoder_append_prefill_config": {
+                    "enabled": false
                 }
             },
             "dynamic_spec_config": {
@@ -1577,6 +1580,13 @@ class DyntraLBConfig:
 
 
 @config
+class DecoderAppendPrefillConfig:
+    """Configuration object for ``scheduler_config.decoder_append_prefill_config``."""
+
+    enabled: bool = False
+
+
+@config
 class SchedulerConfig:
     """Configuration object for ``additional_config["scheduler_config"]``.
 
@@ -1594,6 +1604,9 @@ class SchedulerConfig:
     profiling_chunk_config: ProfilingChunkConfig = dataclasses.field(default_factory=ProfilingChunkConfig)
     batch_job_sched_config: BatchJobSchedConfig = dataclasses.field(default_factory=BatchJobSchedConfig)
     dyntra_lb_config: DyntraLBConfig = dataclasses.field(default_factory=DyntraLBConfig)
+    decoder_append_prefill_config: DecoderAppendPrefillConfig = dataclasses.field(
+        default_factory=DecoderAppendPrefillConfig
+    )
 
     @classmethod
     def from_additional_config(cls, additional_config: dict[str, Any]) -> SchedulerConfig:
@@ -1635,6 +1648,7 @@ class SchedulerConfig:
             "profiling_chunk_config": _resolve("profiling_chunk_config", {}),
             "batch_job_sched_config": _resolve("batch_job_sched_config", {}),
             "dyntra_lb_config": scheduler_config.get("dyntra_lb_config", {}),
+            "decoder_append_prefill_config": scheduler_config.get("decoder_append_prefill_config", {}),
         }
         # Forward nested unknown keys to pydantic so extra="forbid" reports
         # typos instead of the resolver silently dropping them.

@@ -12,9 +12,9 @@ is rejected before scheduling prefill, so the proxy can send the complete
 request through normal P/D instead. Affinity does not reserve KV blocks or
 guarantee a cache hit.
 
-The feature requires explicit Decoder Scheduler configuration and is opt-in at
-the proxy. It is intended for workloads with growing conversation histories
-and relatively short outputs, where repeated Prefiller work can become a
+The feature is opt-in in the Decoder configuration and at the proxy. It is
+intended for workloads with growing conversation histories and relatively short
+outputs, where repeated Prefiller work can become a
 bottleneck. Its benefit depends on cache residency, request lengths, Decoder
 load and the cost of cache-miss fallback.
 
@@ -22,9 +22,9 @@ load and the cost of cache-miss fallback.
 
 - A working vLLM V1 P/D-disaggregated deployment, with Decode services configured
   as `kv_role="kv_consumer"` and prefix caching enabled.
-- The append-prefill admission Scheduler on every Decoder used by the proxy.
-  Select it explicitly with `--scheduler-cls` and set the matching synchronous
-  or asynchronous scheduling mode as described below.
+- `scheduler_config.decoder_append_prefill_config.enabled=true` in every
+  Decoder's `--additional-config`. The platform selects the append-prefill
+  admission Scheduler for its synchronous or asynchronous scheduling mode.
 - The standalone
   `examples/disaggregated_prefill_v1/decoder_append_prefill_proxy_server.py`
   proxy, started with `--enable-decoder-append-prefill`.
@@ -37,9 +37,14 @@ load and the cost of cache-miss fallback.
 
 Keep the Prefill service's normal P/D connector configuration, including its
 `kv_producer` role. On the Decode service, enable prefix caching, retain the
-matching P/D connector with the `kv_consumer` role and explicitly select the
-append-prefill Scheduler. For example, the following shows a synchronous
-Decode service using Mooncake and one internal DP rank:
+matching P/D connector with the `kv_consumer` role and add
+`decoder_append_prefill_config` under `scheduler_config` in `--additional-config`.
+As with DyntraLB, the platform selects the Scheduler from this configuration;
+`--scheduler-cls` is not required. Merge these keys into any existing
+`--additional-config`, and configure the feature only on Decode nodes.
+
+For example, the following shows a synchronous Decode service using Mooncake
+and one internal DP rank:
 
 ```bash
 vllm serve /path/to/model \
@@ -48,7 +53,13 @@ vllm serve /path/to/model \
     --data-parallel-size 1 \
     --enable-prefix-caching \
     --no-async-scheduling \
-    --scheduler-cls vllm_ascend.core.decoder_append_prefill_scheduler.DecoderAppendPrefillScheduler \
+    --additional-config '{
+      "scheduler_config": {
+        "decoder_append_prefill_config": {
+          "enabled": true
+        }
+      }
+    }' \
     --kv-transfer-config '{
       "kv_connector": "MooncakeConnectorV1",
       "kv_role": "kv_consumer",
@@ -60,28 +71,26 @@ Adapt the model, device allocation, parallelism and network settings to your
 existing P/D deployment. The example does not allocate separate devices for
 the Prefill and Decode services.
 
-For asynchronous scheduling, replace the example's `--no-async-scheduling` and
-`--scheduler-cls` arguments with:
+For asynchronous scheduling, replace `--no-async-scheduling` with
+`--async-scheduling`; keep the same `--additional-config`. The platform selects
+`DecoderAppendPrefillScheduler` for synchronous scheduling and
+`AsyncDecoderAppendPrefillScheduler` for asynchronous scheduling.
 
-```bash
---async-scheduling \
---scheduler-cls vllm_ascend.core.decoder_append_prefill_scheduler.AsyncDecoderAppendPrefillScheduler
-```
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `scheduler_config.decoder_append_prefill_config.enabled` | bool | `false` | Enables append-prefill admission and selects its Scheduler on the Decode node. |
 
-Choose the scheduling mode supported by your model and deployment, and always
-pair it with the matching Scheduler class. The proxy flag does not select or
-replace a Decoder's Scheduler. Deployments that do not use append-prefill can
-omit these Scheduler options; without an explicit Scheduler or another Ascend
-scheduling policy, vLLM retains its native synchronous or asynchronous Scheduler.
+Choose the scheduling mode supported by your model and deployment. When the
+feature is disabled, existing Scheduler selection is unchanged. With no
+explicit Scheduler and no other Ascend scheduling policy, vLLM retains its
+native synchronous or asynchronous Scheduler.
 
-Explicitly selecting the original `RecomputeScheduler` or
-`AsyncRecomputeScheduler` does not enable append-prefill admission. Before
-enabling append-prefill at the
-proxy, the deployment administrator must ensure every Decoder uses
-`kv_consumer`, prefix caching and the matching append-prefill admission
-Scheduler. Use the synchronous or asynchronous class for the configured
-scheduling mode, or its combined Recompute class described below. The proxy
-does not remotely inspect the Scheduler or validate backend support.
+The backend configuration and proxy flag are independent. Before enabling
+append-prefill at the proxy, ensure every Decoder uses `kv_consumer`, prefix
+caching and the append-prefill configuration above. The proxy does not configure
+remote Decoders, inspect their Scheduler or validate backend support. Enabling
+Recompute alone does not enable append-prefill admission; see the combined
+configuration below.
 
 ## Start the proxy
 
@@ -204,21 +213,25 @@ before enabling streaming traffic.
 
 Append-prefill works with ordinary synchronous or asynchronous scheduling and
 does not require Recompute or CPU offload. To combine it with Decode-side
-Recompute, enable Recompute and explicitly select the matching combined
-Scheduler. For synchronous Recompute, use these Decode arguments in place of
-the ordinary append-prefill Scheduler arguments:
+Recompute, enable both sibling configurations in the Decode service's
+`--additional-config`:
 
 ```bash
---enable-prefix-caching \
---no-async-scheduling \
---scheduler-cls vllm_ascend.core.decoder_append_prefill_scheduler.DecoderAppendPrefillRecomputeScheduler \
---additional-config '{"scheduler_config":{"recompute_scheduler_enable":true}}'
+--additional-config '{
+  "scheduler_config": {
+    "decoder_append_prefill_config": {
+      "enabled": true
+    },
+    "recompute_scheduler_enable": true
+  }
+}'
 ```
 
-For asynchronous Recompute, use `--async-scheduling` and select
-`vllm_ascend.core.decoder_append_prefill_scheduler.AsyncDecoderAppendPrefillRecomputeScheduler`.
-Keep `recompute_scheduler_enable=true` with either combined class. Enabling
-Recompute alone does not select an append-prefill Scheduler.
+The platform automatically selects `DecoderAppendPrefillRecomputeScheduler`
+with `--no-async-scheduling`, or `AsyncDecoderAppendPrefillRecomputeScheduler`
+with `--async-scheduling`. No `--scheduler-cls` argument is required. These
+configurations remain independent: enabling Recompute alone retains its existing
+Scheduler selection and does not enable append-prefill.
 
 For CPU preservation and reload of preempted KV, follow
 [Preempt Offload Connector](preempt_offload_connector.md) to configure
