@@ -8,13 +8,16 @@ construction are excluded. These tests do not establish NPU or API support.
 
 import ast
 import enum
+import hashlib
 import importlib.util
+import json
 import os
 import sys
 import time
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from contextlib import nullcontext
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, ClassVar
@@ -24,6 +27,11 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "vllm_ascend/core/decoder_append_prefill_scheduler.py"
+COPY_BASELINE_VLLM_REVISION = "544f182d9f0c9bfe8bd7645525951d5e3692a542"
+# Generated independently from Scheduler.schedule in the declared copy baseline.
+# The installed dependency can also be the supported v0.32.0 release, whose
+# upstream schedule legitimately differs from that main-branch snapshot.
+COPY_BASELINE_SCHEDULE_SHA256 = "0d0446b190ef0431a7b7862dd9728af2b27770c3d3b8dcb693a242cc9c75a145"
 VLLM = Path(os.environ.get("VLLM_SOURCE_ROOT", ROOT.parent / "vllm")) / "vllm"
 if not VLLM.is_dir():
     spec = importlib.util.find_spec("vllm")
@@ -71,7 +79,7 @@ def execute_classes(path, names, namespace):
 
 
 @pytest.fixture
-def runtime():
+def runtime(monkeypatch):
     namespace: dict[str, Any] = dict(
         __name__="admission_test_runtime",
         ABC=ABC,
@@ -81,6 +89,8 @@ def runtime():
         Enum=enum.Enum,
         time=time,
         defaultdict=defaultdict,
+        dataclass=dataclass,
+        field=field,
         SchedulerInterface=object,
         _SchedulerBase=object,
         SupportsHMA=type("SupportsHMA", (), {}),
@@ -89,17 +99,27 @@ def runtime():
         Request=TestRequest,
         EngineCoreOutputs=Output,
         EngineCoreOutput=Output,
-        SchedulerOutput=Output,
         KVConnectorBlockState=SimpleNamespace,
         KV_FETCH_WAITING_TO_START="waiting_to_start",
         KV_FETCH_IN_PROGRESS="in_progress",
         KV_FETCH_COMPLETED_WAITING="completed_waiting",
+        KV_FETCH_STAGES=("waiting_to_start", "in_progress", "completed_waiting"),
+        KVCacheManager=lambda **kwargs: Mock(coordinator=SimpleNamespace(single_type_managers=[])),
+        EventPublisherFactory=SimpleNamespace(create=lambda *args: Mock()),
+        EncoderCacheManager=SimpleNamespace(create_manager=lambda **kwargs: Mock()),
+        MambaSpec=type("MambaSpec", (), {}),
         logger=Mock(),
         check_stop=lambda request, max_model_len: False,
         record_function_or_nullcontext=lambda *args: nullcontext(),
         remove_all=lambda seq, removed: [req for req in seq if req not in removed],
         NewRequestData=SimpleNamespace(from_request=lambda request, *args, **kwargs: request),
     )
+    # Dataclasses resolve postponed annotations through their defining module.
+    module = ModuleType(namespace["__name__"])
+    module.__dict__.update(namespace)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    namespace = module.__dict__
+    execute_classes(VLLM / "v1/core/sched/output.py", {"SchedulerOutput"}, namespace)
     execute_classes(VLLM / "v1/request.py", {"RequestStatus"}, namespace)
     execute_classes(VLLM / "v1/core/sched/interface.py", {"PauseState"}, namespace)
     execute_classes(
@@ -147,17 +167,78 @@ def scheduler(runtime, request):
     return make_scheduler(runtime, request.param)
 
 
-def make_scheduler(runtime, class_name):
+def make_scheduler(runtime, class_name, *, prefill_interval=1, lookahead_tokens=0, use_v2_model_runner=False):
     cls = getattr(runtime, class_name)
-    scheduler = cls.__new__(cls)
+    # Execute the real installed Scheduler constructor. Only its cache/event
+    # factories are faked, so release-only missing fields cannot be hidden by
+    # populating an object created with __new__.
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=16,
+            max_num_active_seqs=None,
+            max_num_scheduled_tokens=None,
+            max_num_batched_tokens=64,
+            long_prefill_token_threshold=0,
+            long_prefill_token_threshold_adaptive=False,
+            enable_chunked_prefill=True,
+            policy="fcfs",
+            watermark=0.0,
+            prefill_schedule_interval=prefill_interval,
+            scheduler_reserve_full_isl=False,
+        ),
+        cache_config=SimpleNamespace(
+            num_gpu_blocks=128,
+            enable_prefix_caching=True,
+            enable_mamba_shared_prefix_checkpoint=False,
+            mamba_cache_mode="none",
+        ),
+        model_config=SimpleNamespace(
+            uses_mrope=False,
+            is_encoder_decoder=False,
+            supports_multimodal_inputs=False,
+            max_model_len=256,
+            runner_type="generate",
+            is_diffusion=False,
+            return_sampling_mask=False,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            data_parallel_index=0,
+        ),
+        observability_config=SimpleNamespace(
+            per_request_spec_decode_metrics=None,
+            kv_cache_metrics=False,
+            enable_mfu_metrics=False,
+            enable_logging_iteration_details=False,
+        ),
+        ec_manager_config=SimpleNamespace(get_encoder_cache_manager_obj=lambda: None),
+        aux_output_config=SimpleNamespace(enabled=False),
+        kv_events_config=None,
+        lora_config=None,
+        kv_transfer_config=None,
+        ec_transfer_config=None,
+        speculative_config=None,
+        num_speculative_tokens=0,
+        num_lookahead_tokens=lookahead_tokens,
+        num_prefill_lookahead_tokens=1,
+        max_in_flight_tokens=0,
+        is_mm_encoder_only=False,
+        use_v2_model_runner=use_v2_model_runner,
+    )
+    scheduler = cls(
+        vllm_config=config,
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[], has_mamba_layers=False, needs_kv_cache_zeroing=False),
+        structured_output_manager=Mock(accept_tokens=Mock(return_value=True)),
+        block_size=16,
+        include_finished_set=True,
+    )
     empty_blocks = SimpleNamespace(get_block_ids=lambda: ([],), blocks=([],))
     scheduler.__dict__.update(
         current_step=0,
         max_num_scheduled_tokens=64,
-        vllm_config=SimpleNamespace(speculative_config=None, kv_transfer_config=None),
-        scheduler_config=SimpleNamespace(
-            max_num_batched_tokens=64, long_prefill_token_threshold=0, enable_chunked_prefill=True
-        ),
         _pause_state=runtime.PauseState.UNPAUSED,
         max_num_encoder_input_tokens=0,
         running=[],
@@ -179,14 +260,10 @@ def make_scheduler(runtime, class_name):
         aux_output_connector=None,
         prefix_replay_tokens=0,
         prefix_replay_group_ids=(),
-        can_skip_drafts=False,
         adaptive_long_prefill_threshold=False,
-        local_prefill_interval=1,
-        num_executed_steps=0,
-        last_prefill_step=-1,
         _kv_fetch_counts={"waiting_to_start": 0, "in_progress": 0, "completed_waiting": 0},
         _kv_fetch_stages={},
-        num_lookahead_tokens=0,
+        num_lookahead_tokens=lookahead_tokens,
         is_encoder_decoder=False,
         need_mamba_block_aligned_split=False,
         scheduler_reserve_full_isl=False,
@@ -200,7 +277,7 @@ def make_scheduler(runtime, class_name):
         is_mm_encoder_only=False,
         structured_output_manager=Mock(accept_tokens=Mock(return_value=True)),
         kv_cache_config=SimpleNamespace(kv_cache_groups=[None]),
-        use_v2_model_runner=False,
+        use_v2_model_runner=use_v2_model_runner,
         model_uses_mrope=False,
         prev_step_scheduled_req_ids=set(),
         reset_preempted_req_ids=set(),
@@ -249,11 +326,13 @@ def enqueue(runtime, scheduler, request_id="miss", *, marked=True, hits=0, outpu
         num_stale_output_tokens=0,
         num_in_flight_tokens=0,
         num_output_placeholders=0,
+        next_decode_eligible_step=0,
         drop_stale_output=False,
         lora_request=None,
         shared_prefix_boundary=0,
         num_tokens=32,
         num_prompt_tokens=32,
+        _all_token_ids=[0] * 32,
         prefill_stats=None,
         has_encoder_inputs=False,
         num_output_tokens=output_tokens,
@@ -453,7 +532,7 @@ def test_prefix_replay_requires_a_useful_local_prefix(runtime, scheduler, hits, 
 
 
 def test_only_documented_admission_deltas_change_schedule():
-    """Catch accidental loss of upstream scheduling behavior during refreshes."""
+    """Check the declared copy baseline, independently of the installed lane."""
 
     def schedule_tree(path, class_name):
         cls = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == class_name)
@@ -469,8 +548,21 @@ def test_only_documented_admission_deltas_change_schedule():
             condition = ast.unparse(node.test)
             if "_pending_decoder_cache_rejections" in condition or "_should_reject_decoder_cache_miss" in condition:
                 return None
+            if condition == "hasattr(scheduler_output, 'skip_drafts')":
+                expected = ast.parse("scheduler_output.skip_drafts = not drafts_needed").body[0]
+                assert not node.orelse
+                assert len(node.body) == 1 and ast.dump(node.body[0]) == ast.dump(expected)
+                return None
             if "_requires_decoder_cache_hit" in condition:
                 node.test = node.test.values[0]
+            return self.generic_visit(node)
+
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Name) and node.func.id == "SchedulerOutput":
+                assert all(keyword.arg != "skip_drafts" for keyword in node.keywords)
+                index = next(i for i, keyword in enumerate(node.keywords) if keyword.arg == "ec_manager_metadata")
+                keyword = ast.keyword(arg="skip_drafts", value=ast.parse("not drafts_needed", mode="eval").body)
+                node.keywords.insert(index, keyword)
             return self.generic_visit(node)
 
         def visit_Expr(self, node):
@@ -479,8 +571,27 @@ def test_only_documented_admission_deltas_change_schedule():
             return self.generic_visit(node)
 
     actual = StripAdmission().visit(schedule_tree(SOURCE, "DecoderAppendPrefillScheduler"))
-    upstream = schedule_tree(VLLM / "v1/core/sched/scheduler.py", "Scheduler")
-    assert ast.dump(actual) == ast.dump(upstream)
+
+    def canonical_ast(node):
+        if isinstance(node, ast.AST):
+            # Python 3.12 added empty type_params fields to FunctionDef. Ignore
+            # that structural-only difference when checking the same source.
+            return [
+                type(node).__name__,
+                [
+                    (name, canonical_ast(value))
+                    for name, value in ast.iter_fields(node)
+                    if name != "type_params" or value
+                ],
+            ]
+        if isinstance(node, list):
+            return [canonical_ast(value) for value in node]
+        return node
+
+    docstring = ast.get_docstring(ast.parse(SOURCE.read_text()))
+    assert docstring is not None and COPY_BASELINE_VLLM_REVISION in docstring
+    encoded = json.dumps(canonical_ast(actual), separators=(",", ":")).encode()
+    assert hashlib.sha256(encoded).hexdigest() == COPY_BASELINE_SCHEDULE_SHA256
 
 
 @pytest.mark.parametrize("async_enabled", [False, True])
@@ -497,6 +608,68 @@ def test_constructor_preserves_async_setup(runtime, monkeypatch, async_enabled):
     assert instance._decoder_cache_rejection_batches == {}
     if async_enabled:
         assert instance._spec_token_placeholders == [-1, -1]
+
+
+@pytest.mark.parametrize("async_enabled", [False, True])
+@pytest.mark.parametrize("work", ["empty", "hit", "chunk", "miss"])
+def test_native_constructor_and_output_preserve_version_contract(runtime, async_enabled, work):
+    options = dict(prefill_interval=4, lookahead_tokens=1, use_v2_model_runner=True)
+    native = make_scheduler(runtime, "Scheduler", **options)
+    name = "AsyncDecoderAppendPrefillScheduler" if async_enabled else "DecoderAppendPrefillScheduler"
+    scheduler = make_scheduler(runtime, name, **options)
+    for attr, default in (
+        ("can_skip_drafts", False),
+        ("local_prefill_interval", 1),
+        ("num_executed_steps", 0),
+        ("last_prefill_step", -1),
+    ):
+        assert getattr(scheduler, attr) == getattr(native, attr, default)
+    if work != "empty":
+        request = enqueue(runtime, scheduler, hits=0 if work == "miss" else 16)
+        request.max_tokens = 10
+        if work == "chunk":
+            scheduler.max_num_scheduled_tokens = 8
+
+    output = scheduler.schedule()
+
+    # This is the actual dependency's dataclass, not a kwargs-accepting fake.
+    assert type(output) is runtime.SchedulerOutput
+    expected_tokens = {"hit": {"miss": 16}, "chunk": {"miss": 8}}
+    assert output.num_scheduled_tokens == expected_tokens.get(work, {})
+    if "skip_drafts" in runtime.SchedulerOutput.__dataclass_fields__:
+        assert output.skip_drafts is (work != "hit")
+    else:
+        assert not hasattr(output, "skip_drafts")
+    if work == "miss":
+        result = scheduler.update_from_output(output, empty_model_output())
+        assert result[2].outputs[0].stop_reason == "decoder_cache_miss"
+
+
+@pytest.mark.parametrize("async_enabled", [False, True])
+def test_native_prefill_cadence_is_retained_only_when_upstream_supports_it(runtime, async_enabled):
+    native = make_scheduler(runtime, "Scheduler", prefill_interval=3)
+    name = "AsyncDecoderAppendPrefillScheduler" if async_enabled else "DecoderAppendPrefillScheduler"
+    scheduler = make_scheduler(runtime, name, prefill_interval=3)
+    decode = enqueue(runtime, scheduler, "decode", marked=False)
+    scheduler.waiting.remove_request(decode)
+    decode.status = runtime.RequestStatus.RUNNING
+    decode.is_prefill_chunk = False
+    decode.num_computed_tokens = 32
+    decode.num_tokens = decode.num_tokens_with_spec = 33
+    scheduler.running.append(decode)
+    enqueue(runtime, scheduler, "append", hits=16)
+    scheduler.num_executed_steps = scheduler.last_prefill_step = 1
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens["decode"] == 1
+    if getattr(native, "local_prefill_interval", 1) > 1:
+        assert "append" not in output.num_scheduled_tokens
+        assert list(scheduler.waiting)[0].request_id == "append"
+        assert scheduler.last_prefill_step == 1
+    else:
+        assert output.num_scheduled_tokens["append"] == 16
+    assert scheduler.num_executed_steps == 2
 
 
 def test_inflight_preempted_output_is_delivered_before_cache_loss(runtime, scheduler):

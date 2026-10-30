@@ -9,9 +9,12 @@ required before scheduling prefill; other requests retain upstream behavior.
 
 The schedule body is copied from vLLM 544f182d9f0c9bfe8bd7645525951d5e3692a542:
 there is no upstream hook that can reject one waiting request and continue the
-same scheduling iteration. The only deltas are per-step rejection bookkeeping,
-skipping pending rejections, the admission guard, and bypassing remote prefix
-matching for marked requests. Keep the drift test aligned when updating it.
+same scheduling iteration. Schedule deltas are per-step rejection bookkeeping,
+skipping pending rejections, the admission guard, bypassing remote prefix
+matching for marked requests, and assigning the draft-skipping hint only when
+the output supports it. Initialization supplies disabled draft-skipping and
+local-prefill-cadence defaults for v0.32.0. Keep the drift test aligned when
+updating it.
 
 DyntraLB is currently unsupported: it requires Decoder instances to execute
 decode-only work, while this scheduler also executes append-prefill on Decoders.
@@ -128,6 +131,16 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
     prefill_capacity_bound: bool
     last_prefill_step: int
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # v0.32.0 has neither draft skipping nor local prefill cadence. Keep
+        # its normal draft generation and ungated prefill behavior, while
+        # preserving the values initialized by newer upstream schedulers.
+        self.can_skip_drafts = getattr(self, "can_skip_drafts", False)
+        self.local_prefill_interval = getattr(self, "local_prefill_interval", 1)
+        self.num_executed_steps = getattr(self, "num_executed_steps", 0)
+        self.last_prefill_step = getattr(self, "last_prefill_step", -self.local_prefill_interval)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         rejected_requests: list[Request] = []
         self.current_step += 1
@@ -164,6 +177,8 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Whether a request scheduled this step can use the drafts proposed after
         # it. Stays set if that request is preempted later in the step.
+        # True on v0.32.0: later OR expressions short-circuit, so they never
+        # call _drafts_unused(), which that upstream version does not provide.
         drafts_needed = not self.can_skip_drafts
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
@@ -1038,9 +1053,11 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
             kv_cache_block_copies=pending_kv_cache_block_copies,
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
-            skip_drafts=not drafts_needed,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
+        # v0.32.0's output dataclass does not carry this optional worker hint.
+        if hasattr(scheduler_output, "skip_drafts"):
+            scheduler_output.skip_drafts = not drafts_needed
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
