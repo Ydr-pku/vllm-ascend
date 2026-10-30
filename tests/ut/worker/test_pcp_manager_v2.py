@@ -30,7 +30,6 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
-from vllm_ascend.ascend_config import SchedulerConfig
 from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
 from vllm_ascend.platform import _setup_worker_and_scheduler
 from vllm_ascend.utils import vllm_version_is
@@ -143,7 +142,15 @@ def test_decode_sharding_does_not_add_a_parallel_config_field():
         compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
         cache_config=None,
     )
-    ascend_config = SimpleNamespace(scheduler_config=SchedulerConfig())
+    ascend_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            recompute_scheduler_enable=False,
+            dyntra_lb_config=SimpleNamespace(enabled=False),
+            decoder_append_prefill_config=SimpleNamespace(enabled=False),
+            profiling_chunk_config=SimpleNamespace(enabled=False),
+            batch_job_sched_config=SimpleNamespace(enabled=False),
+        )
+    )
     with (
         patch("vllm_ascend.platform.get_current_hardware_profile") as hardware_profile,
         patch("vllm_ascend.platform.refresh_block_size"),
