@@ -1141,7 +1141,8 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
     """Validate Ascend-specific options.
 
     Covers the scheduler extension policies (enable_balance_scheduling / short_request_first_config /
-    dyntra_lb_config / recompute_scheduler_enable). Reads from the AscendConfig singleton
+    dyntra_lb_config / decoder_append_prefill_config / recompute_scheduler_enable).
+    Reads from the AscendConfig singleton
     initialized from vllm_config; env fallbacks are handled inside AscendConfig.
     """
     # Validate scheduler extension policies (read ascend_config.scheduler_config)
@@ -1152,10 +1153,21 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         vllm_config.additional_config = {}
         additional_config = vllm_config.additional_config
     scheduler_extension_config = ascend_config.scheduler_config
-    decoder_append = _is_decoder_append_prefill_scheduler(vllm_config.scheduler_config.scheduler_cls)
+    decoder_append_config = scheduler_extension_config.decoder_append_prefill_config
+    decoder_append = decoder_append_config.enabled or _is_decoder_append_prefill_scheduler(
+        vllm_config.scheduler_config.scheduler_cls
+    )
     if decoder_append:
-        # Fail before Ascend policy selection can overwrite explicit admission.
+        # Fail before Ascend policy selection can overwrite cache admission.
         _validate_decoder_append_prefill_policies(vllm_config, scheduler_extension_config)
+    if decoder_append_config.enabled:
+        kv_transfer_config = vllm_config.kv_transfer_config
+        kv_role = getattr(kv_transfer_config, "kv_role", None)
+        if kv_transfer_config is None or kv_role != "kv_consumer":
+            raise ValueError(
+                "Decoder append-prefill is only supported on PD-disaggregated D nodes "
+                f"(kv_role='kv_consumer', but got kv_role={kv_role!r})."
+            )
 
     # enable_balance_scheduling: only supported in PD-mixed mode
     if scheduler_extension_config.enable_balance_scheduling:
@@ -1500,6 +1512,10 @@ def _setup_worker_and_scheduler(
     scheduler_config = ascend_config.scheduler_config
     if scheduler_config.dyntra_lb_config.enabled and not scheduler_config.recompute_scheduler_enable:
         vllm_config.scheduler_config.scheduler_cls = _get_dyntra_lb_scheduler_cls(
+            async_scheduling=vllm_config.scheduler_config.async_scheduling
+        )
+    if scheduler_config.decoder_append_prefill_config.enabled and not scheduler_config.recompute_scheduler_enable:
+        vllm_config.scheduler_config.scheduler_cls = _get_decoder_append_prefill_scheduler_cls(
             async_scheduling=vllm_config.scheduler_config.async_scheduling
         )
 
@@ -1857,6 +1873,8 @@ def _validate_decoder_append_prefill_policies(vllm_config, config) -> None:
             "Decoder append-prefill is incompatible with these currently unsupported policies: " + "; ".join(conflicts)
         )
     selected = vllm_config.scheduler_config.scheduler_cls
+    if not _is_decoder_append_prefill_scheduler(selected):
+        return
     name = selected.__name__ if isinstance(selected, type) else selected.rsplit(".", 1)[-1]
     if "Recompute" in name and not config.recompute_scheduler_enable:
         raise ValueError("The combined scheduler requires recompute_scheduler_enable.")
@@ -1898,6 +1916,12 @@ def _get_recompute_scheduler_cls(
     if async_scheduling:
         return "vllm_ascend.core.recompute_scheduler.AsyncRecomputeScheduler"
     return "vllm_ascend.core.recompute_scheduler.RecomputeScheduler"
+
+
+def _get_decoder_append_prefill_scheduler_cls(*, async_scheduling: bool) -> str:
+    if async_scheduling:
+        return "vllm_ascend.core.decoder_append_prefill_scheduler.AsyncDecoderAppendPrefillScheduler"
+    return "vllm_ascend.core.decoder_append_prefill_scheduler.DecoderAppendPrefillScheduler"
 
 
 def _get_dyntra_lb_scheduler_cls(*, async_scheduling: bool) -> str:

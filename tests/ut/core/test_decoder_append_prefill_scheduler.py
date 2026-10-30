@@ -852,7 +852,14 @@ def execute_functions(path, names, namespace):
 
 @pytest.fixture
 def platform_runtime():
-    ns = {"logger": Mock(), "_validate_kv_load_failure_policy": lambda config: None}
+    ns = {
+        "logger": Mock(),
+        "_validate_kv_load_failure_policy": lambda config: None,
+        "refresh_block_size": Mock(),
+        "_downgrade_swa_bounded_replay": Mock(),
+        "get_current_hardware_profile": lambda: SimpleNamespace(supports=lambda _: False),
+        "HardwareCapability": SimpleNamespace(AUTO_ENABLE_CUSTOM_OPS="auto_enable_custom_ops"),
+    }
     ns["RecomputeSchedulerConfig"] = SimpleNamespace(
         initialize_from_config=lambda config: SimpleNamespace(**vars(config.scheduler_config))
     )
@@ -861,7 +868,10 @@ def platform_runtime():
         {
             "_is_decoder_append_prefill_scheduler",
             "_get_recompute_scheduler_cls",
+            "_get_decoder_append_prefill_scheduler_cls",
+            "_get_dyntra_lb_scheduler_cls",
             "_check_ascend_config",
+            "_setup_worker_and_scheduler",
             "_validate_decoder_append_prefill_policies",
         },
         ns,
@@ -869,12 +879,16 @@ def platform_runtime():
     return SimpleNamespace(**ns)
 
 
-def make_platform_config(*, async_enabled=False, role="kv_consumer", selected=None, recompute=False, dyntra=False):
+def make_platform_config(
+    *, async_enabled=False, role="kv_consumer", selected=None, recompute=False, dyntra=False, append_prefill=False
+):
     config = SimpleNamespace(
         additional_config={},
         kv_transfer_config=None if role is None else SimpleNamespace(kv_role=role, has_connector=lambda _: False),
         scheduler_config=SimpleNamespace(scheduler_cls=selected, async_scheduling=async_enabled, policy="fcfs"),
-        parallel_config=SimpleNamespace(data_parallel_size=2 if dyntra else 1, nnodes_within_dp=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=2 if dyntra else 1, nnodes_within_dp=1, worker_cls="test.Worker"
+        ),
     )
     policies = SimpleNamespace(
         enable_balance_scheduling=False,
@@ -883,6 +897,7 @@ def make_platform_config(*, async_enabled=False, role="kv_consumer", selected=No
             key: SimpleNamespace(enabled=False)
             for key in (
                 "dyntra_lb_config",
+                "decoder_append_prefill_config",
                 "short_request_first_config",
                 "profiling_chunk_config",
                 "batch_job_sched_config",
@@ -890,6 +905,7 @@ def make_platform_config(*, async_enabled=False, role="kv_consumer", selected=No
         },
     )
     policies.dyntra_lb_config.enabled = dyntra
+    policies.decoder_append_prefill_config.enabled = append_prefill
     return config, SimpleNamespace(
         scheduler_config=policies,
         finegrained_tp_config=SimpleNamespace(oproj_tensor_parallel_size=1, mlp_tensor_parallel_size=1),
@@ -1195,6 +1211,7 @@ def test_unspecified_scheduler_uses_upstream_default(
 ):
     config, ascend_config = make_platform_config(async_enabled=async_enabled, role=role)
     platform_runtime._check_ascend_config(config, ascend_config)
+    platform_runtime._setup_worker_and_scheduler(config, ascend_config)
     assert config.scheduler_config.scheduler_cls is None
     assert upstream_scheduler_selector(config.scheduler_config) is (
         runtime.AsyncScheduler if async_enabled else runtime.Scheduler
@@ -1208,6 +1225,7 @@ def test_custom_scheduler_without_recompute_is_preserved(platform_runtime, async
     selected = type("Scheduler", (), {"__module__": "custom"}) if as_type else "custom.Scheduler"
     config, ascend_config = make_platform_config(async_enabled=async_enabled, role=role, selected=selected)
     platform_runtime._check_ascend_config(config, ascend_config)
+    platform_runtime._setup_worker_and_scheduler(config, ascend_config)
     assert config.scheduler_config.scheduler_cls is selected
 
 
@@ -1219,6 +1237,7 @@ def test_explicit_append_scheduler_without_recompute_is_preserved(platform_runti
     selected = type(name, (), {"__module__": module}) if as_type else f"{module}.{name}"
     config, ascend_config = make_platform_config(async_enabled=async_enabled, selected=selected)
     platform_runtime._check_ascend_config(config, ascend_config)
+    platform_runtime._setup_worker_and_scheduler(config, ascend_config)
     assert config.scheduler_config.scheduler_cls is selected
 
 
@@ -1238,6 +1257,7 @@ def test_existing_recompute_configuration_does_not_enable_admission(platform_run
         async_enabled=name.startswith("Async"), selected=selected, recompute=True, dyntra="DyntraLB" in name
     )
     platform_runtime._check_ascend_config(config, ascend_config)
+    platform_runtime._setup_worker_and_scheduler(config, ascend_config)
     assert config.scheduler_config.scheduler_cls == f"{module}.{name}"
     assert not platform_runtime._is_decoder_append_prefill_scheduler(config.scheduler_config.scheduler_cls)
 
@@ -1251,6 +1271,7 @@ def test_recompute_preserves_baseline_custom_scheduler_override(platform_runtime
         async_enabled=async_enabled, selected=selected, recompute=True, dyntra=dyntra
     )
     platform_runtime._check_ascend_config(config, ascend_config)
+    platform_runtime._setup_worker_and_scheduler(config, ascend_config)
     name = "DyntraLBRecomputeScheduler" if dyntra else "RecomputeScheduler"
     if async_enabled:
         name = f"Async{name}"
@@ -1266,5 +1287,67 @@ def test_prefill_ignores_recompute_and_preserves_custom_scheduler(platform_runti
         async_enabled=async_enabled, role="kv_producer", selected=selected, recompute=True
     )
     platform_runtime._check_ascend_config(config, ascend_config)
+    platform_runtime._setup_worker_and_scheduler(config, ascend_config)
     assert config.scheduler_config.scheduler_cls is selected
     assert config.additional_config["scheduler_config"]["recompute_scheduler_enable"] is False
+
+
+@pytest.mark.parametrize("async_enabled", [False, True])
+@pytest.mark.parametrize("recompute", [False, True])
+@pytest.mark.parametrize("selection", ["default", "path", "class"])
+def test_append_prefill_config_selects_scheduler_like_dyntra_lb(platform_runtime, async_enabled, recompute, selection):
+    selected: str | type | None = None
+    if selection == "path":
+        selected = "custom.Scheduler"
+    elif selection == "class":
+        selected = type("Scheduler", (), {"__module__": "custom"})
+    for feature in ("append_prefill", "dyntra"):
+        config, ascend_config = make_platform_config(
+            async_enabled=async_enabled, selected=selected, recompute=recompute, **{feature: True}
+        )
+        platform_runtime._check_ascend_config(config, ascend_config)
+        platform_runtime._setup_worker_and_scheduler(config, ascend_config)
+        if feature == "append_prefill":
+            module = "vllm_ascend.core.decoder_append_prefill_scheduler"
+            name = "DecoderAppendPrefillRecomputeScheduler" if recompute else "DecoderAppendPrefillScheduler"
+        elif recompute:
+            module = "vllm_ascend.core.recompute_scheduler"
+            name = "DyntraLBRecomputeScheduler"
+        else:
+            module = "vllm_ascend.core.dyntra_lb_scheduler"
+            name = "DyntraLBScheduler"
+        if async_enabled:
+            name = f"Async{name}"
+        assert config.scheduler_config.scheduler_cls == f"{module}.{name}"
+
+
+@pytest.mark.parametrize("role", [None, "kv_producer", "kv_both"])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_append_prefill_config_rejects_non_decoder_nodes(platform_runtime, role, recompute):
+    config, ascend_config = make_platform_config(role=role, recompute=recompute, append_prefill=True)
+    with pytest.raises(ValueError, match="kv_consumer"):
+        platform_runtime._check_ascend_config(config, ascend_config)
+    assert config.scheduler_config.scheduler_cls is None
+
+
+@pytest.mark.parametrize(
+    ("policy", "reason"),
+    [
+        ("enable_balance_scheduling", "PD-mixed"),
+        ("dyntra_lb_config", "decode-only"),
+        ("short_request_first_config", "PD-disaggregated Decoders"),
+        ("profiling_chunk_config", "PP>1"),
+        ("batch_job_sched_config", "long-input, short-output agentic"),
+    ],
+)
+@pytest.mark.parametrize("recompute", [False, True])
+def test_append_prefill_config_rejects_conflicting_policy_before_selection(platform_runtime, policy, reason, recompute):
+    config, ascend_config = make_platform_config(recompute=recompute, append_prefill=True)
+    policies = ascend_config.scheduler_config
+    if policy == "enable_balance_scheduling":
+        policies.enable_balance_scheduling = True
+    else:
+        getattr(policies, policy).enabled = True
+    with pytest.raises(ValueError, match=reason):
+        platform_runtime._check_ascend_config(config, ascend_config)
+    assert config.scheduler_config.scheduler_cls is None
