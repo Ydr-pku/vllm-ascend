@@ -39,18 +39,15 @@ import argparse
 import asyncio
 import base64
 import functools
-import heapq
-import ipaddress
 import json
 import logging
 import os
 import sys
-import tempfile
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from multiprocessing.managers import BaseManager
 from pathlib import Path
@@ -62,14 +59,35 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+if __package__:
+    from examples.disaggregated_prefill_v1 import load_balance_proxy_server_example as base_proxy
+    from examples.disaggregated_prefill_v1.load_balance_proxy_server_example import ServerRole, WorkerRuntime
+else:
+    import load_balance_proxy_server_example as base_proxy
+    from load_balance_proxy_server_example import ServerRole, WorkerRuntime
+
+# Share stateless helpers and runtime types, while retaining this entry point's
+# own app, arguments and cross-worker scheduler state.
+extract_cached_tokens = base_proxy.extract_cached_tokens
+update_cached_tokens_in_chunk = base_proxy.update_cached_tokens_in_chunk
+encode_response_chunk = base_proxy.encode_response_chunk
+next_req_id = base_proxy.next_req_id
+calculate_prefill_score = base_proxy.calculate_prefill_score
+calculate_decode_score = base_proxy.calculate_decode_score
+server_key = base_proxy.server_key
+build_server_url = base_proxy.build_server_url
+build_base_url = base_proxy.build_base_url
+manager_config_path = base_proxy.manager_config_path
+write_manager_config = base_proxy.write_manager_config
+read_manager_config = base_proxy.read_manager_config
+cleanup_manager_config = base_proxy.cleanup_manager_config
+listen_for_disconnect = base_proxy.listen_for_disconnect
+auth_headers = base_proxy.auth_headers
+send_request_to_service = base_proxy.send_request_to_service
+_abort_prefill_selection = base_proxy._abort_prefill_selection
+parse_server_addresses = base_proxy.parse_server_addresses
+
 logger = logging.getLogger(__name__)
-
-try:
-    import uvloop  # type: ignore[import-not-found]
-
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-except ImportError:
-    pass
 
 
 class SSEFramer:
@@ -118,11 +136,6 @@ class SSEFramer:
     def finish(self) -> None:
         if self.buffer.strip() or self.data or not self.done:
             raise ValueError("Truncated SSE stream or missing DONE")
-
-
-class ServerRole(str, Enum):
-    PREFILL = "prefill"
-    DECODE = "decode"
 
 
 class RouteMode(str, Enum):
@@ -174,50 +187,13 @@ class BackendContractError(RuntimeError):
         self.code = code
 
 
-TAINT_PRIORITY = 1e15
 SESSION_ID_HEADER = "X-Session-ID"
 DP_RANK_HEADER = "X-data-parallel-rank"
-
-
-def extract_cached_tokens(response_json: dict) -> int | None:
-    usage = response_json.get("usage") or {}
-    prompt_tokens_details = usage.get("prompt_tokens_details") or {}
-    cached_tokens = prompt_tokens_details.get("cached_tokens")
-    return cached_tokens if isinstance(cached_tokens, int) else 0
-
-
-def update_cached_tokens_in_chunk(chunk_json: dict, cached_tokens: int | None) -> bool:
-    if cached_tokens is None:
-        return False
-    usage = chunk_json.get("usage")
-    if not isinstance(usage, dict):
-        return False
-    prompt_tokens_details = usage.get("prompt_tokens_details")
-    if not isinstance(prompt_tokens_details, dict):
-        prompt_tokens_details = {}
-    usage["prompt_tokens_details"] = prompt_tokens_details
-    prompt_tokens_details["cached_tokens"] = cached_tokens
-    return True
-
-
-def encode_response_chunk(chunk_json: dict, is_sse: bool) -> bytes:
-    chunk = json.dumps(chunk_json, ensure_ascii=False).encode("utf-8")
-    return b"data: " + chunk + b"\n\n" if is_sse else chunk
 
 
 global_args: argparse.Namespace | None = None
 shared_scheduler: "SharedProxyScheduler | None" = None
 runtime: "WorkerRuntime | None" = None
-
-
-@dataclass
-class BackendServer:
-    host: str
-    port: int
-    ordinal: int
-    active_tokens: float = 0.0
-    active_kv_cache: float = 0.0
-    heap_seq: int = 0
 
 
 @dataclass
@@ -231,67 +207,13 @@ class SessionAffinity:
     cache_generation: int = 0
 
 
-@dataclass
-class RolePools:
-    """Per-role scheduling state: live servers, priority heap, and drain-isolated keys."""
-
-    servers: dict[str, BackendServer] = field(default_factory=dict)
-    heap: list[tuple[float, int, int, str]] = field(default_factory=list)
-    tainted: set[str] = field(default_factory=set)
-
-
 def setup_logging(log_level: str) -> None:
-    logging.basicConfig(
-        level=logging.WARNING,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        force=True,
-    )
+    base_proxy.setup_logging(log_level)
     logger.setLevel(getattr(logging, log_level.upper()))
 
 
-def next_req_id() -> str:
-    return str(uuid.uuid4())
-
-
-def calculate_prefill_score(request_length: int) -> float:
-    length_score = request_length / 4.0
-    return length_score * 0.0345 + 120.0745
-
-
-def calculate_decode_score(request_length: int) -> float:
-    return request_length
-
-
-def normalize_host(host: str) -> str:
-    return host.replace("localhost", "0.0.0.0").replace("127.0.0.1", "0.0.0.0")
-
-
-def server_key(host: str, port: int) -> str:
-    return f"{normalize_host(host)}:{int(port)}"
-
-
-def build_server_url(host: str, port: int) -> str:
-    url = f"http://{host}:{port}"
-    try:
-        ip = ipaddress.ip_address(host)
-        if isinstance(ip, ipaddress.IPv6Address):
-            url = f"http://[{host}]:{port}"
-    except Exception:
-        pass
-    return url
-
-
-def build_base_url(host: str, port: int) -> str:
-    return f"{build_server_url(host, port)}/v1"
-
-
-class SharedProxyScheduler:
-    """Centralized mutable scheduling state shared by all uvicorn workers.
-
-    Uses lazy-deletion min-heap: on priority change, push a new entry and
-    bump the server's ``heap_seq`` counter; stale entries (whose seq does
-    not match) are skipped on pop.
-    """
+class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
+    """Add session ownership to the shared P/D proxy's load scheduler."""
 
     def __init__(
         self,
@@ -302,116 +224,18 @@ class SharedProxyScheduler:
     ):
         if decoder_data_parallel_size < 1:
             raise ValueError("Decoder data parallel size must be greater than zero")
-        self._lock = threading.RLock()
+        super().__init__(prefiller_instances, decoder_instances)
         self.decoder_data_parallel_size = decoder_data_parallel_size
         # An operator-supplied deployment label, NOT a backend-validated lease.
         # Affinities live only in this scheduler and are empty on proxy restart.
         self.decoder_engine_epoch = decoder_engine_epoch or str(uuid.uuid4())
         self._next_decoder_dp_rank: dict[str, int] = {}
-        self.request_num = 0
-        self.waiting_nodes: dict[str, tuple[str, tuple[str, int], int]] = {}
         self.session_affinities: dict[str, SessionAffinity] = {}
-        self._pools: dict[ServerRole, RolePools] = {
-            ServerRole.PREFILL: RolePools(),
-            ServerRole.DECODE: RolePools(),
-        }
-        self._ordinal = 0
-
-        for host, port in prefiller_instances:
-            self._add_server_no_lock(ServerRole.PREFILL, host, port)
-        for host, port in decoder_instances:
-            self._add_server_no_lock(ServerRole.DECODE, host, port)
-
-    def _pool(self, role: ServerRole) -> RolePools:
-        return self._pools[role]
-
-    @property
-    def prefillers(self) -> dict[str, BackendServer]:
-        return self._pool(ServerRole.PREFILL).servers
-
-    @property
-    def decoders(self) -> dict[str, BackendServer]:
-        return self._pool(ServerRole.DECODE).servers
-
-    def _next_ordinal(self) -> int:
-        ordinal = self._ordinal
-        self._ordinal += 1
-        return ordinal
-
-    def _priority(self, role: ServerRole, entry: BackendServer, key: str) -> float:
-        if key in self._pool(role).tainted:
-            return TAINT_PRIORITY
-        if role is ServerRole.PREFILL:
-            return entry.active_tokens + entry.active_kv_cache * 0.3
-        return entry.active_tokens
-
-    def _push_heap(self, role: ServerRole, key: str) -> None:
-        pool = self._pool(role)
-        entry = pool.servers[key]
-        entry.heap_seq += 1
-        heapq.heappush(pool.heap, (self._priority(role, entry, key), entry.ordinal, entry.heap_seq, key))
-        if len(pool.heap) > 2 * len(pool.servers):
-            self._reset_heap(role)
-
-    def _pop_valid(self, role: ServerRole) -> str:
-        pool = self._pool(role)
-        while pool.heap:
-            _, _, seq, key = heapq.heappop(pool.heap)
-            if key not in pool.servers:
-                continue
-            entry = pool.servers[key]
-            if entry.heap_seq == seq:
-                return key
-        raise RuntimeError(f"No available {role.value} servers")
-
-    def _reset_heap(self, role: ServerRole, *, bump_seq: bool = False) -> None:
-        pool = self._pool(role)
-        heap = []
-        for key, entry in pool.servers.items():
-            if bump_seq:
-                entry.heap_seq += 1
-            heap.append((self._priority(role, entry, key), entry.ordinal, entry.heap_seq, key))
-        heapq.heapify(heap)
-        pool.heap = heap
-
-    def _add_server_no_lock(self, role: ServerRole, host: str, port: int) -> bool:
-        key = server_key(host, port)
-        pool = self._pool(role)
-        if key in pool.servers:
-            return False
-        pool.servers[key] = BackendServer(host, int(port), self._next_ordinal())
-        self._push_heap(role, key)
-        return True
-
-    def get_snapshot(self) -> dict[str, list[dict[str, Any]]]:
-        with self._lock:
-            return {
-                "prefill_instances": [
-                    {"host": e.host, "port": e.port}
-                    for _, e in sorted(self.prefillers.items(), key=lambda item: item[1].ordinal)
-                ],
-                "decode_instances": [
-                    {"host": e.host, "port": e.port}
-                    for _, e in sorted(self.decoders.items(), key=lambda item: item[1].ordinal)
-                ],
-            }
-
-    def log_status(self, msg: str) -> None:
-        snapshot = self.get_snapshot()
-        logger.info(
-            "%s prefill=%s decode=%s",
-            msg,
-            [f"{s['host']}:{s['port']}" for s in snapshot["prefill_instances"]],
-            [f"{s['host']}:{s['port']}" for s in snapshot["decode_instances"]],
-        )
 
     def healthcheck(self) -> dict[str, Any]:
         with self._lock:
             return {
-                "status": "ok",
-                "prefill_instances": len(self.prefillers),
-                "decode_instances": len(self.decoders),
-                "request_num": self.request_num,
+                **super().healthcheck(),
                 "active_sessions": len(self.session_affinities),
                 "decoder_data_parallel_size": self.decoder_data_parallel_size,
                 "decoder_engine_epoch": self.decoder_engine_epoch,
@@ -421,56 +245,9 @@ class SharedProxyScheduler:
                 ),
             }
 
-    def _pick_server(
-        self,
-        role: ServerRole,
-        load: float,
-        *,
-        active_tokens: bool = False,
-        kv_cache: bool = False,
-    ) -> dict[str, Any]:
-        key = self._pop_valid(role)
-        entry = self._pool(role).servers[key]
-        if active_tokens:
-            entry.active_tokens += load
-        if kv_cache:
-            entry.active_kv_cache += load
-        self._push_heap(role, key)
-        return {"key": key, "host": entry.host, "port": entry.port}
-
-    def _release_load(
-        self,
-        role: ServerRole,
-        key: str | None,
-        load: float,
-        *,
-        active_tokens: bool = False,
-        kv_cache: bool = False,
-    ) -> None:
-        if not key or key not in self._pool(role).servers:
-            return
-        entry = self._pool(role).servers[key]
-        if active_tokens:
-            entry.active_tokens -= load
-        if kv_cache:
-            entry.active_kv_cache = max(0.0, entry.active_kv_cache - load)
-        self._push_heap(role, key)
-
-    def begin_request(self, load: float) -> dict[str, Any]:
-        """Pick a prefiller, reserve KV pressure, and count this as an active request."""
-        with self._lock:
-            picked = self._pick_server(ServerRole.PREFILL, load, kv_cache=True)
-            self.request_num += 1
-            return picked
-
-    def reserve_prefill_kv(self, load: float) -> dict[str, Any]:
-        """Pick a prefiller for recompute without bumping the active request count."""
-        with self._lock:
-            return self._pick_server(ServerRole.PREFILL, load, kv_cache=True)
-
     def pick_decoder(self, load: float) -> dict[str, Any]:
         with self._lock:
-            decoder = self._pick_server(ServerRole.DECODE, load, active_tokens=True)
+            decoder = super().pick_decoder(load)
             return self._with_decoder_owner(decoder, None)
 
     def _with_decoder_owner(self, decoder: dict[str, Any], dp_rank: int | None) -> dict[str, Any]:
@@ -611,105 +388,14 @@ class SharedProxyScheduler:
             if affinity.decoder_key in decoder_keys:
                 self.session_affinities.pop(session_id, None)
 
-    def release_prefill_kv(self, key: str, load: float) -> None:
-        with self._lock:
-            self._release_load(ServerRole.PREFILL, key, load, kv_cache=True)
-
-    def release_decoder(self, key: str, load: float) -> None:
-        with self._lock:
-            self._release_load(ServerRole.DECODE, key, load, active_tokens=True)
-
-    def finish_request(
-        self,
-        prefiller_key: str | None,
-        prefiller_load: float,
-        decoder_key: str | None,
-        decoder_load: float,
-        release_prefill_kv: bool,
-    ) -> None:
-        with self._lock:
-            if release_prefill_kv:
-                self._release_load(ServerRole.PREFILL, prefiller_key, prefiller_load, kv_cache=True)
-            self._release_load(ServerRole.DECODE, decoder_key, decoder_load, active_tokens=True)
-            self.request_num = max(0, self.request_num - 1)
-
-    def get_waiting_nodes(self) -> dict[str, tuple[str, tuple[str, int], int]]:
-        with self._lock:
-            return dict(self.waiting_nodes)
-
-    def add_instances(self, role: ServerRole, instances: list[tuple[str, int]]) -> list[str]:
-        waiting_nodes: list[str] = []
-        with self._lock:
-            servers = self._pool(role).servers
-            for host, port in instances:
-                key = server_key(host, port)
-                if key in servers or key in self.waiting_nodes:
-                    continue
-                self.waiting_nodes[key] = (role.value, (host, int(port)), 0)
-                waiting_nodes.append(f"{host}:{port}")
-        return waiting_nodes
-
-    def mark_waiting_retry(self, key: str, retry_count: int) -> None:
-        with self._lock:
-            if key not in self.waiting_nodes:
-                return
-            instance_type, server, _ = self.waiting_nodes[key]
-            self.waiting_nodes[key] = (instance_type, server, retry_count)
-
-    def activate_waiting_instance(self, role: ServerRole, host: str, port: int) -> None:
-        with self._lock:
-            key = server_key(host, port)
-            self.waiting_nodes.pop(key, None)
-            pool = self._pool(role)
-            if key in pool.tainted:
-                pool.tainted.discard(key)
-                self._push_heap(role, key)
-                return
-            if self._add_server_no_lock(role, host, port):
-                self.log_status(f"Add {role.value} instance: {host}:{port}.")
-
-    def drop_waiting_instance(self, key: str) -> None:
-        with self._lock:
-            self.waiting_nodes.pop(key, None)
-
     def remove_instances(self, role: ServerRole, instances: list[tuple[str, int]]) -> bool:
         if not instances:
             return False
         keys = {server_key(host, port) for host, port in instances}
         with self._lock:
-            pool = self._pool(role)
             if role is ServerRole.DECODE:
                 self._invalidate_decoder_sessions_no_lock(keys)
-            if self.request_num > 0:
-                pool.tainted.update(keys)
-                self._reset_heap(role, bump_seq=True)
-                logger.warning("Start to taint %s instances %s.", role.value, sorted(keys))
-                return True
-
-            removed = False
-            for key in keys:
-                removed = pool.servers.pop(key, None) is not None or removed
-                self.waiting_nodes.pop(key, None)
-            pool.tainted.difference_update(keys)
-            if removed:
-                self._reset_heap(role, bump_seq=True)
-                self.log_status(f"Remove {role.value} instances: {sorted(keys)}.")
-            return False
-
-    def finalize_tainted_instances(self) -> None:
-        with self._lock:
-            if self.request_num != 0:
-                return
-            for role in ServerRole:
-                pool = self._pool(role)
-                if not pool.tainted:
-                    continue
-                keys = list(pool.tainted)
-                for key in keys:
-                    pool.servers.pop(key, None)
-                pool.tainted.clear()
-                self._reset_heap(role, bump_seq=True)
-                self.log_status(f"Remove {role.value} instances after drain: {keys}.")
+            return super().remove_instances(role, instances)
 
 
 class SchedulerManager(BaseManager):
@@ -723,58 +409,6 @@ def _shared_scheduler_proxy() -> "SharedProxyScheduler":
 
 
 SchedulerManager.register("get_scheduler", callable=_shared_scheduler_proxy)
-
-
-class WorkerRuntime:
-    def __init__(self, scheduler: Any):
-        self.scheduler = scheduler
-        self._clients: dict[ServerRole, dict[str, httpx.AsyncClient]] = {
-            ServerRole.PREFILL: {},
-            ServerRole.DECODE: {},
-        }
-        self._async_lock = asyncio.Lock()
-
-    async def schedule(self, method: str, /, *args, **kwargs) -> Any:
-        async with self._async_lock:
-            return getattr(self.scheduler, method)(*args, **kwargs)
-
-    async def get_client(self, role: ServerRole, key: str) -> httpx.AsyncClient:
-        clients = self._clients[role]
-        if key not in clients:
-            await self.sync_clients()
-        return clients[key]
-
-    async def sync_clients(self) -> None:
-        snapshot = self.scheduler.get_snapshot()
-        role_targets = {
-            ServerRole.PREFILL: {
-                server_key(s["host"], s["port"]): (s["host"], s["port"]) for s in snapshot["prefill_instances"]
-            },
-            ServerRole.DECODE: {
-                server_key(s["host"], s["port"]): (s["host"], s["port"]) for s in snapshot["decode_instances"]
-            },
-        }
-        for role, targets in role_targets.items():
-            await self._sync_clients(role, targets)
-
-    async def _sync_clients(self, role: ServerRole, targets: dict[str, tuple[str, int]]) -> None:
-        clients = self._clients[role]
-        for key in [key for key in clients if key not in targets]:
-            await clients.pop(key).aclose()
-        for key, (host, port) in targets.items():
-            if key in clients:
-                continue
-            clients[key] = httpx.AsyncClient(
-                timeout=None,
-                base_url=build_base_url(host, port),
-                limits=httpx.Limits(max_connections=100000, max_keepalive_connections=100000),
-            )
-
-    async def close(self) -> None:
-        for role in ServerRole:
-            for client in list(self._clients[role].values()):
-                await client.aclose()
-            self._clients[role].clear()
 
 
 def get_runtime() -> WorkerRuntime:
@@ -819,37 +453,6 @@ class NodeListener:
                 return True
         except (httpx.RequestError, httpx.HTTPStatusError):
             return False
-
-
-def manager_config_path(proxy_port: int) -> Path:
-    return Path(tempfile.gettempdir()) / f"vllm_lb_proxy_manager_{proxy_port}.json"
-
-
-def write_manager_config(proxy_port: int, host: str, manager_port: int, authkey: bytes) -> None:
-    manager_config_path(proxy_port).write_text(
-        json.dumps(
-            {
-                "host": host,
-                "port": manager_port,
-                "authkey": base64.b64encode(authkey).decode("ascii"),
-            }
-        ),
-        encoding="utf-8",
-    )
-
-
-def read_manager_config(proxy_port: int) -> dict[str, Any]:
-    path = manager_config_path(proxy_port)
-    if not path.is_file():
-        raise RuntimeError(
-            f"Manager config not found at {path}. "
-            "Start the proxy from __main__ with --workers > 1 before worker processes connect."
-        )
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def cleanup_manager_config(proxy_port: int) -> None:
-    manager_config_path(proxy_port).unlink(missing_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1020,13 +623,6 @@ def create_app():
     return app
 
 
-async def listen_for_disconnect(request: Request) -> None:
-    while True:
-        message = await request.receive()
-        if message["type"] == "http.disconnect":
-            break
-
-
 def with_cancellation(handler_func):
     @functools.wraps(handler_func)
     async def wrapper(*args, **kwargs):
@@ -1063,13 +659,6 @@ def with_cancellation(handler_func):
                                 await result.finalize()
 
     return wrapper
-
-
-def auth_headers(request_id: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-        "X-Request-Id": request_id,
-    }
 
 
 def decoder_headers(request_id: str, decoder_dp_rank: int) -> dict[str, str]:
@@ -1130,52 +719,6 @@ async def plan_request_route(request: Request, req_data: dict) -> RoutePlan:
     )
 
 
-def build_prefill_request(req_data: dict) -> dict:
-    payload = req_data.copy()
-    payload["kv_transfer_params"] = {
-        "do_remote_decode": True,
-        "do_remote_prefill": False,
-        "remote_engine_id": None,
-        "remote_block_ids": None,
-        "remote_host": None,
-        "remote_port": None,
-    }
-    payload["stream"] = False
-    payload["max_tokens"] = 1
-    payload["min_tokens"] = 1
-    if "max_completion_tokens" in payload:
-        payload["max_completion_tokens"] = 1
-    payload.pop("stream_options", None)
-    return payload
-
-
-async def send_request_to_service(
-    client: httpx.AsyncClient,
-    endpoint: str,
-    req_data: dict,
-    request_id: str,
-    max_retries: int = 3,
-    base_delay: float = 0.2,
-):
-    req_data = build_prefill_request(req_data)
-    headers = auth_headers(request_id)
-    max_attempts = max(1, max_retries)
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = await client.post(endpoint, json=req_data, headers=headers)
-            response.raise_for_status()
-            return response
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 400 or attempt == max_attempts:
-                raise
-            logger.warning("Attempt %s failed for %s: %s", attempt, endpoint, exc)
-        except httpx.RequestError as exc:
-            if attempt == max_attempts:
-                raise
-            logger.warning("Attempt %s failed for %s: %s", attempt, endpoint, exc)
-        await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
-
-
 async def stream_service_response(
     client: httpx.AsyncClient,
     endpoint: str,
@@ -1234,19 +777,6 @@ async def stream_service_response(
                 raise
             logger.warning("Attempt %s failed for streaming %s: %s", attempt, endpoint, exc)
         await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
-
-
-async def _abort_prefill_selection(
-    runtime: WorkerRuntime,
-    prefiller_key: str,
-    prefiller_score: float,
-    *,
-    is_initial_request: bool,
-) -> None:
-    if is_initial_request:
-        await runtime.schedule("finish_request", prefiller_key, prefiller_score, None, 0.0, release_prefill_kv=True)
-    else:
-        await runtime.schedule("release_prefill_kv", prefiller_key, prefiller_score)
 
 
 async def _finish_instance(runtime: WorkerRuntime, info: InstanceInfo, *, release_prefill_kv: bool) -> None:
@@ -1989,10 +1519,6 @@ async def adjust_instances_impl(adjust_mode: str, request: Request):
     }
 
 
-def parse_server_addresses(instances: list[str]) -> list[tuple[str, int]]:
-    return [(host, int(port)) for host, port in (instance.split(":") for instance in instances)]
-
-
 @app.post("/v1/completions")
 @with_cancellation
 async def handle_completions(request: Request):
@@ -2086,7 +1612,7 @@ if __name__ == "__main__":
     setup_logging(global_args.log_level)
     bootstrap_parent_process(global_args)
 
-    module_name = Path(__file__).stem
+    module_name = f"{__package__}.{Path(__file__).stem}" if __package__ else Path(__file__).stem
     try:
         uvicorn.run(
             f"{module_name}:create_app",

@@ -144,7 +144,6 @@ def test_decode_sharding_does_not_add_a_parallel_config_field():
     )
     ascend_config = SimpleNamespace(
         scheduler_config=SimpleNamespace(
-            recompute_scheduler_enable=False,
             dyntra_lb_config=SimpleNamespace(enabled=False),
             decoder_append_prefill_enable=False,
             profiling_chunk_config=SimpleNamespace(enabled=False),

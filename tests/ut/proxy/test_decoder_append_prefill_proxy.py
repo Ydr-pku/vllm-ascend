@@ -5,22 +5,16 @@
 import argparse
 import asyncio
 import copy
-import importlib.util
 import json
 import sys
 import unittest
-from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
-PROXY_PATH = Path(__file__).parents[3] / "examples/disaggregated_prefill_v1/decoder_append_prefill_proxy_server.py"
-SPEC = importlib.util.spec_from_file_location("decoder_append_prefill_proxy_for_test", PROXY_PATH)
-assert SPEC is not None and SPEC.loader is not None
-proxy = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = proxy
-SPEC.loader.exec_module(proxy)
+from examples.disaggregated_prefill_v1 import decoder_append_prefill_proxy_server as proxy
+from examples.disaggregated_prefill_v1 import load_balance_proxy_server_example as base_proxy
 
 
 class FakeRequest:
@@ -40,6 +34,60 @@ def make_scheduler():
         prefiller_instances=[("127.0.0.1", 8100)],
         decoder_instances=[("127.0.0.1", 8200), ("127.0.0.1", 8201)],
     )
+
+
+@pytest.mark.asyncio
+async def test_entrypoints_keep_configuration_and_runtime_state_separate(monkeypatch):
+    base_scheduler = base_proxy.SharedProxyScheduler(
+        prefiller_instances=[("127.0.0.1", 8300), ("127.0.0.1", 8301)],
+        decoder_instances=[("127.0.0.1", 8400)],
+    )
+    append_scheduler = make_dp4_scheduler()
+    base_args = argparse.Namespace(workers=1, enable_prefill_affinity=True)
+    append_args = argparse.Namespace(workers=1, enable_decoder_append_prefill=True, session_affinity_ttl=60.0)
+    for module, args, scheduler in (
+        (base_proxy, base_args, base_scheduler),
+        (proxy, append_args, append_scheduler),
+    ):
+        monkeypatch.setattr(module, "global_args", args)
+        monkeypatch.setattr(module, "shared_scheduler", scheduler)
+        monkeypatch.setattr(module, "runtime", None)
+
+    async with base_proxy.lifespan(base_proxy.app):
+        base_runtime = base_proxy.get_runtime()
+        async with proxy.lifespan(proxy.app):
+            append_runtime = proxy.get_runtime()
+            assert base_proxy.get_global_args() is base_args
+            assert proxy.get_global_args() is append_args
+            assert base_runtime is not append_runtime
+            assert base_runtime.scheduler is base_scheduler
+            assert append_runtime.scheduler is append_scheduler
+            assert base_proxy.app is not proxy.app
+
+            decoder_key = bind_and_finish_first_turn(append_scheduler)
+            route = await proxy.plan_request_route(FakeRequest({"X-Session-ID": "session-1"}), {})
+            assert route.pinned_decoder_key == decoder_key
+            assert route.pinned_decoder_dp_rank == 0
+            append_scheduler.finish_session("session-1", True)
+
+            first = base_scheduler.begin_request(10.0, affinity_key="original-proxy-session")
+            base_scheduler.finish_request(first["key"], 10.0, None, 0.0, release_prefill_kv=True)
+            second = base_scheduler.begin_request(20.0, affinity_key="original-proxy-session")
+            assert second["key"] == first["key"]
+            assert base_scheduler.request_num == 1
+            assert base_scheduler.prefillers[second["key"]].active_kv_cache == 20.0
+            assert append_scheduler.request_num == 0
+            base_scheduler.finish_request(second["key"], 20.0, None, 0.0, release_prefill_kv=True)
+            base_clients = [client for clients in base_runtime._clients.values() for client in clients.values()]
+            append_clients = [client for clients in append_runtime._clients.values() for client in clients.values()]
+
+        assert proxy.runtime is None
+        assert all(client.is_closed for client in append_clients)
+        assert base_proxy.get_runtime() is base_runtime
+        assert all(not client.is_closed for client in base_clients)
+
+    assert base_proxy.runtime is None
+    assert all(client.is_closed for client in base_clients)
 
 
 def bind_and_finish_first_turn(scheduler, session_id="session-1"):
