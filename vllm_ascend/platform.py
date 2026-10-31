@@ -1141,7 +1141,7 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
     """Validate Ascend-specific options.
 
     Covers the scheduler extension policies (enable_balance_scheduling / short_request_first_config /
-    dyntra_lb_config / decoder_append_prefill_config / recompute_scheduler_enable).
+    dyntra_lb_config / decoder_append_prefill_enable / recompute_scheduler_enable).
     Reads from the AscendConfig singleton
     initialized from vllm_config; env fallbacks are handled inside AscendConfig.
     """
@@ -1153,14 +1153,14 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         vllm_config.additional_config = {}
         additional_config = vllm_config.additional_config
     scheduler_extension_config = ascend_config.scheduler_config
-    decoder_append_config = scheduler_extension_config.decoder_append_prefill_config
-    decoder_append = decoder_append_config.enabled or _is_decoder_append_prefill_scheduler(
+    decoder_append_enabled = scheduler_extension_config.decoder_append_prefill_enable
+    decoder_append = decoder_append_enabled or _is_decoder_append_prefill_scheduler(
         vllm_config.scheduler_config.scheduler_cls
     )
     if decoder_append:
         # Fail before Ascend policy selection can overwrite cache admission.
         _validate_decoder_append_prefill_policies(vllm_config, scheduler_extension_config)
-    if decoder_append_config.enabled:
+    if decoder_append_enabled:
         kv_transfer_config = vllm_config.kv_transfer_config
         kv_role = getattr(kv_transfer_config, "kv_role", None)
         if kv_transfer_config is None or kv_role != "kv_consumer":
@@ -1514,7 +1514,7 @@ def _setup_worker_and_scheduler(
         vllm_config.scheduler_config.scheduler_cls = _get_dyntra_lb_scheduler_cls(
             async_scheduling=vllm_config.scheduler_config.async_scheduling
         )
-    if scheduler_config.decoder_append_prefill_config.enabled and not scheduler_config.recompute_scheduler_enable:
+    if scheduler_config.decoder_append_prefill_enable and not scheduler_config.recompute_scheduler_enable:
         vllm_config.scheduler_config.scheduler_cls = _get_decoder_append_prefill_scheduler_cls(
             async_scheduling=vllm_config.scheduler_config.async_scheduling
         )

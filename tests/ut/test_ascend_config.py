@@ -36,7 +36,6 @@ from vllm_ascend.ascend_config import (
     AscendConfig,
     AscendFusionConfig,
     AscendWarmupConfig,
-    DecoderAppendPrefillConfig,
     DynamicSpecConfig,
     DyntraLBConfig,
     EplbConfig,
@@ -1138,36 +1137,41 @@ class TestSchedulerConfig(TestBase):
 
         self.assertFalse(config.enable_balance_scheduling)
         self.assertFalse(config.recompute_scheduler_enable)
-        self.assertFalse(config.decoder_append_prefill_config.enabled)
+        self.assertFalse(config.decoder_append_prefill_enable)
         self.assertFalse(config.short_request_first_config.enabled)
         self.assertFalse(config.profiling_chunk_config.enabled)
         self.assertFalse(hasattr(config, "_additional_config"))
         self.assertFalse(hasattr(config, "_balance_env_value"))
 
-    def test_decoder_append_prefill_nested_config_is_typed_and_independent(self):
-        config = SchedulerConfig.from_additional_config(
-            {
-                "scheduler_config": {
-                    "decoder_append_prefill_config": {"enabled": "true"},
-                    "recompute_scheduler_enable": True,
-                }
-            }
-        )
-        self.assertIsInstance(config.decoder_append_prefill_config, DecoderAppendPrefillConfig)
-        self.assertTrue(config.decoder_append_prefill_config.enabled)
-        self.assertTrue(config.recompute_scheduler_enable)
-        self.assertFalse(config.dyntra_lb_config.enabled)
-        self.assertFalse(SchedulerConfig.from_additional_config({}).decoder_append_prefill_config.enabled)
+    def test_decoder_append_prefill_flat_switch_is_independent(self):
+        for recompute in (False, True):
+            with self.subTest(recompute=recompute):
+                config = SchedulerConfig.from_additional_config(
+                    {
+                        "scheduler_config": {
+                            "decoder_append_prefill_enable": "true",
+                            "recompute_scheduler_enable": recompute,
+                        }
+                    }
+                )
+                self.assertIs(config.decoder_append_prefill_enable, True)
+                self.assertIs(config.recompute_scheduler_enable, recompute)
+                self.assertFalse(config.dyntra_lb_config.enabled)
+        self.assertFalse(SchedulerConfig.from_additional_config({}).decoder_append_prefill_enable)
 
-    def test_decoder_append_prefill_bool_validation_and_unknown_keys(self):
+    def test_decoder_append_prefill_bool_validation_and_obsolete_key(self):
         config = SchedulerConfig.from_additional_config(
-            {"scheduler_config": {"decoder_append_prefill_config": {"enabled": "false"}}}
+            {"scheduler_config": {"decoder_append_prefill_enable": "false"}}
         )
-        self.assertFalse(config.decoder_append_prefill_config.enabled)
-        values: list[Any] = [{"enabled": 2}, {"enabled": False, "unknown_option": True}, []]
+        self.assertIs(config.decoder_append_prefill_enable, False)
+        values: list[Any] = [2, "enabled", {"enabled": True}, []]
         for value in values:
             with self.subTest(value=value), self.assertRaises(ValueError):
-                SchedulerConfig.from_additional_config({"scheduler_config": {"decoder_append_prefill_config": value}})
+                SchedulerConfig.from_additional_config({"scheduler_config": {"decoder_append_prefill_enable": value}})
+        with self.assertRaises(ValueError):
+            SchedulerConfig.from_additional_config(
+                {"scheduler_config": {"decoder_append_prefill_config": {"enabled": True}}}
+            )
 
     @patch("vllm_ascend.ascend_config.logger.warning_once")
     def test_none_config_uses_defaults_and_legacy_fallback(self, mock_warning_once):

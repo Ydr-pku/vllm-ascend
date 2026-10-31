@@ -12,10 +12,9 @@ Run this standalone example with httpx, fastapi, anyio and uvicorn installed::
 
 Send a stable X-Session-ID on each turn. The feature is disabled by default.
 When enabled, cold sessions use P/D and warm sessions use their pinned Decoder.
-Explicitly configure each Decoder's scheduler_cls with the matching sync/async
-append-prefill admission Scheduler and enable prefix caching. Starting this proxy
-does not select or replace a backend Scheduler; see the Decoder Append-Prefill
-feature guide.
+Enable scheduler_config.decoder_append_prefill_enable in each Decoder's
+--additional-config and enable prefix caching. The platform selects the matching
+append-prefill admission Scheduler; see the Decoder Append-Prefill feature guide.
 
 Decoder-local routing requires Decoder prefix caching and backend support for
 vllm_xargs.require_decoder_cache_hit: reject a zero-hit request before prefill

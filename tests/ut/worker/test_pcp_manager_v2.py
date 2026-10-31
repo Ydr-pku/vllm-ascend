@@ -146,7 +146,7 @@ def test_decode_sharding_does_not_add_a_parallel_config_field():
         scheduler_config=SimpleNamespace(
             recompute_scheduler_enable=False,
             dyntra_lb_config=SimpleNamespace(enabled=False),
-            decoder_append_prefill_config=SimpleNamespace(enabled=False),
+            decoder_append_prefill_enable=False,
             profiling_chunk_config=SimpleNamespace(enabled=False),
             batch_job_sched_config=SimpleNamespace(enabled=False),
         )

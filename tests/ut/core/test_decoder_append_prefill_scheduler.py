@@ -893,11 +893,11 @@ def make_platform_config(
     policies = SimpleNamespace(
         enable_balance_scheduling=False,
         recompute_scheduler_enable=recompute,
+        decoder_append_prefill_enable=append_prefill,
         **{
             key: SimpleNamespace(enabled=False)
             for key in (
                 "dyntra_lb_config",
-                "decoder_append_prefill_config",
                 "short_request_first_config",
                 "profiling_chunk_config",
                 "batch_job_sched_config",
@@ -905,7 +905,6 @@ def make_platform_config(
         },
     )
     policies.dyntra_lb_config.enabled = dyntra
-    policies.decoder_append_prefill_config.enabled = append_prefill
     return config, SimpleNamespace(
         scheduler_config=policies,
         finegrained_tp_config=SimpleNamespace(oproj_tensor_parallel_size=1, mlp_tensor_parallel_size=1),
