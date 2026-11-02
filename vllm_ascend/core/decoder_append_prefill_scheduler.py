@@ -77,8 +77,7 @@ class DecoderCacheAdmissionMixin(_SchedulerBase):
         return blocks, num_local, shared_boundary, False
 
     def _should_reject_decoder_cache_miss(self, request: Request, local_hits: int) -> bool:
-        # Hits fully consumed by bounded SWA replay save no local prefill.
-        return self._requires_decoder_cache_hit(request) and local_hits <= self.prefix_replay_tokens
+        return self._requires_decoder_cache_hit(request) and local_hits <= 0
 
     def _record_decoder_cache_rejections(self, output: SchedulerOutput, requests: list[Request]) -> None:
         if requests:

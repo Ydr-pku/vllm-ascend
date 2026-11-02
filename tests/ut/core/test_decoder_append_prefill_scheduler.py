@@ -522,13 +522,15 @@ def test_cache_miss_is_deferred_while_kv_holding_request_is_admitted(runtime, sc
     assert not scheduler.waiting and not scheduler.kv_holding_waiting and not scheduler.deferred_waiting
 
 
-@pytest.mark.parametrize("hits,rejected", [(0, True), (16, True), (32, False)])
-def test_prefix_replay_requires_a_useful_local_prefix(runtime, scheduler, hits, rejected):
-    enqueue(runtime, scheduler, hits=hits)
-    scheduler.prefix_replay_tokens = 16
+@pytest.mark.parametrize("hits,expected_tokens", [(0, None), (16, 64), (32, 64), (48, 48)])
+def test_prefix_replay_does_not_reject_a_local_hit(runtime, scheduler, hits, expected_tokens):
+    request = enqueue(runtime, scheduler, hits=hits)
+    request.num_tokens = request.num_prompt_tokens = 64
+    request._all_token_ids = [0] * 64
+    scheduler.prefix_replay_tokens = 32
     output = scheduler.schedule()
-    assert bool(scheduler._pending_decoder_cache_rejections) == rejected
-    assert bool(output.num_scheduled_tokens) != rejected
+    assert bool(scheduler._pending_decoder_cache_rejections) == (hits == 0)
+    assert output.num_scheduled_tokens == ({} if expected_tokens is None else {request.request_id: expected_tokens})
 
 
 def test_only_documented_admission_deltas_change_schedule():
