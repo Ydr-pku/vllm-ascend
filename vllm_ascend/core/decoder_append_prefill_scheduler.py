@@ -57,9 +57,9 @@ class DecoderCacheAdmissionMixin(_SchedulerBase):
         # Scheduler policy compatibility is validated in platform._check_ascend_config.
         super().__init__(*args, **kwargs)
         self._pending_decoder_cache_rejections: dict[str, Request] = {}
-        # EngineCore retains this exact SchedulerOutput until update_from_output.
-        # Keep references here, not on the output sent to model workers.
-        self._decoder_cache_rejection_batches: dict[int, tuple[SchedulerOutput, list[Request]]] = {}
+        # EngineCore retains each SchedulerOutput until update_from_output, so
+        # its identity can key this local request list without storing it again.
+        self._decoder_cache_rejection_batches: dict[int, list[Request]] = {}
 
     @staticmethod
     def _requires_decoder_cache_hit(request: Request) -> bool:
@@ -79,15 +79,15 @@ class DecoderCacheAdmissionMixin(_SchedulerBase):
 
     def _record_decoder_cache_rejections(self, output: SchedulerOutput, requests: list[Request]) -> None:
         if requests:
-            self._decoder_cache_rejection_batches[id(output)] = (output, requests)
+            self._decoder_cache_rejection_batches[id(output)] = requests
 
     def _finish_decoder_cache_rejections(self, output: SchedulerOutput) -> dict[int, list[EngineCoreOutput]]:
-        batch = self._decoder_cache_rejection_batches.pop(id(output), None)
+        requests = self._decoder_cache_rejection_batches.pop(id(output), None)
         results: dict[int, list[EngineCoreOutput]] = defaultdict(list)
-        if batch is None:
+        if requests is None:
             return results
         request_ids = []
-        for request in batch[1]:
+        for request in requests:
             request_id = request.request_id
             if self._pending_decoder_cache_rejections.get(request_id) is request:
                 del self._pending_decoder_cache_rejections[request_id]

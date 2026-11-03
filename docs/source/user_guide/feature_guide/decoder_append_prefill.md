@@ -121,9 +121,9 @@ The first turn establishes the Decoder owner and DP rank. A subsequent turn with
 
 Use `proxy_metrics.initial_route`, `final_route` and `admission_fallback` to distinguish attempted local routing from the route that completed the request. Owner, DP rank and deployment epoch are also reported. For streaming, HTTP headers describe the initial route and cannot change after streaming starts; inspect the response's `proxy_metrics` for fallback information.
 
-## Cache misses and streaming compatibility
+## Cache misses
 
-The proxy marks local attempts with `vllm_xargs.require_decoder_cache_hit=1`. The Scheduler requires a usable local prefix that saves prefill work, rather than accepting remote cache availability as a local hit. An initial miss emits `stop_reason="decoder_cache_miss"` with no generated output and without scheduling that request's prefill. The proxy then retries through P/D with the original history and generation budget.
+The proxy marks local attempts with `vllm_xargs.require_decoder_cache_hit=1`. The Scheduler requires a nonzero local prefix-cache hit; remote cache availability alone does not satisfy this requirement. An initial miss emits `stop_reason="decoder_cache_miss"` with no generated output and without scheduling that request's prefill. The proxy then retries through P/D with the original history and generation budget.
 
 ## Optional Recompute and KV offload
 

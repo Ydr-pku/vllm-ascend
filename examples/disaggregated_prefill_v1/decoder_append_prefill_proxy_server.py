@@ -77,7 +77,6 @@ calculate_decode_score = base_proxy.calculate_decode_score
 server_key = base_proxy.server_key
 build_server_url = base_proxy.build_server_url
 build_base_url = base_proxy.build_base_url
-manager_config_path = base_proxy.manager_config_path
 write_manager_config = base_proxy.write_manager_config
 read_manager_config = base_proxy.read_manager_config
 cleanup_manager_config = base_proxy.cleanup_manager_config
@@ -204,7 +203,6 @@ class SessionAffinity:
     state: SessionState
     decoder_dp_rank: int | None = None
     decoder_engine_epoch: str = ""
-    cache_generation: int = 0
 
 
 def setup_logging(log_level: str) -> None:
@@ -352,7 +350,6 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
             if affinity is not None and affinity.state is SessionState.IN_FLIGHT:
                 affinity.decoder_key = None
                 affinity.decoder_dp_rank = None
-                affinity.cache_generation += 1
 
     def finish_session(self, session_id: str, success: bool) -> None:
         """Commit or roll back a reserved session after response completion."""
@@ -374,10 +371,6 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
                 return
             affinity.state = SessionState.READY
             affinity.last_access_time = time.monotonic()
-
-    def invalidate_session(self, session_id: str) -> None:
-        with self._lock:
-            self.session_affinities.pop(session_id, None)
 
     def invalidate_all_sessions(self) -> None:
         with self._lock:
@@ -887,12 +880,10 @@ async def assign_pd(
 
 
 async def assign_decoder_local(
-    api: str,
     req_data: dict,
     request_length: int,
     route: RoutePlan,
 ) -> InstanceInfo:
-    del api
     if route.pinned_decoder_key is None or route.pinned_decoder_dp_rank is None:
         raise RuntimeError("Decoder-local route requires a pinned Decoder and DP rank")
     runtime = get_runtime()
@@ -920,7 +911,7 @@ async def assign_decoder_local(
 async def assign_request(api: str, req_data: dict, request_length: int, route: RoutePlan) -> InstanceInfo:
     if route.mode is RouteMode.DECODER_LOCAL:
         try:
-            return await assign_decoder_local(api, req_data, request_length, route)
+            return await assign_decoder_local(req_data, request_length, route)
         except BackendContractError:
             raise
         except RuntimeError:

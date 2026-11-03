@@ -514,7 +514,7 @@ def test_cache_miss_is_deferred_while_kv_holding_request_is_admitted(runtime, sc
     assert not scheduler.kv_holding_waiting
     assert scheduler.deferred_waiting == {miss}
     assert scheduler._pending_decoder_cache_rejections == {miss.request_id: miss}
-    assert scheduler._decoder_cache_rejection_batches[id(output)] == (output, [miss])
+    assert scheduler._decoder_cache_rejection_batches[id(output)] == [miss]
     model_output = empty_model_output()
     model_output.req_id_to_index = {"held": 0}
     result = scheduler.update_from_output(output, model_output)
