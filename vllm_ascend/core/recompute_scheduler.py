@@ -107,9 +107,6 @@ class RecomputeScheduler(Scheduler):
         """Hook for decoder-local admission before connector lookup/allocation."""
         return True
 
-    def _get_admission_replay_tokens(self, request: Request, local_hits: int) -> int:
-        return 0
-
     def _get_external_prefix_cache_hit(self, request: Request, local_hits: int) -> tuple[int | None, bool]:
         return self.connector.get_num_new_matched_tokens(request, local_hits)
 
@@ -650,7 +647,6 @@ class RecomputeScheduler(Scheduler):
                 duplicate_encoder_inputs = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
-                num_admission_replay_tokens = 0
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -662,9 +658,6 @@ class RecomputeScheduler(Scheduler):
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
-                    if did_prefix_cache_lookup:
-                        num_admission_replay_tokens = self._get_admission_replay_tokens(request, num_computed_tokens)
-                        num_computed_tokens -= num_admission_replay_tokens
                     # Number of tokens to be scheduled.
                     # We use `request.num_tokens` instead of
                     # `request.num_prompt_tokens` to consider the resumed
@@ -780,7 +773,7 @@ class RecomputeScheduler(Scheduler):
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    max(num_new_tokens - num_admission_replay_tokens, 0),
+                    num_new_tokens,
                     num_new_computed_tokens=num_new_local_computed_tokens,
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,

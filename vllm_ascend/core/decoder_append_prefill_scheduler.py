@@ -1127,11 +1127,6 @@ class DecoderAppendPrefillRecomputeScheduler(DecoderCacheAdmissionMixin, Recompu
             return False
         return True
 
-    def _get_admission_replay_tokens(self, request: Request, local_hits: int) -> int:
-        if self._requires_decoder_cache_hit(request):
-            return self._mark_prefix_replay(request, local_hits, window_loaded=False)
-        return 0
-
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         failed = request.request_id in self.failed_recving_kv_req_ids
         super()._update_waiting_for_remote_kv(request)
