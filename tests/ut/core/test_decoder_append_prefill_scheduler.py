@@ -800,7 +800,7 @@ def test_failed_restore_terminates_without_scheduling_local_recompute(runtime, c
 
 
 @pytest.mark.parametrize("decode_first", [False, True])
-def test_combined_mixed_batch_does_not_pad_decode_in_either_order(runtime, combined, decode_first):
+def test_combined_mixed_batch_preserves_recompute_padding_in_either_order(runtime, combined, decode_first):
     combined.num_spec_tokens = 2
     combined._spec_token_placeholders = [-1, -1]
     names = ["decode", "append"] if decode_first else ["append", "decode"]
@@ -809,13 +809,12 @@ def test_combined_mixed_batch_does_not_pad_decode_in_either_order(runtime, combi
         if name == "decode":
             req.num_tokens = req.num_prompt_tokens = 17
     batch = combined.schedule()
-    assert batch.num_scheduled_tokens == {"decode": 1, "append": 16}
-    # Async scheduling may add draft placeholders after scheduling; they must
-    # not turn this first decode into a padded three-token allocation.
+    assert batch.num_scheduled_tokens == {"decode": 3, "append": 16}
+    assert batch.scheduled_spec_decode_tokens == {"decode": [-1, -1]}
     allocations = {
         call.args[0].request_id: call.args[1] for call in combined.kv_cache_manager.allocate_slots.call_args_list
     }
-    assert allocations == {"decode": 1, "append": 16}
+    assert allocations == {"decode": 3, "append": 16}
 
 
 def test_plain_recompute_still_pads_first_decode(runtime):

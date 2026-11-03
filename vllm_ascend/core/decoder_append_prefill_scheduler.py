@@ -21,9 +21,7 @@ decode-only work, while this scheduler also executes append-prefill on Decoders.
 Recompute variants share admission here and reuse RecomputeScheduler.schedule().
 A preempted request with live offload state can restore its own KV without a
 new local cache hit. Failed recovery preserves the no-replay-after-output
-contract. First-decode padding is disabled for the combination because a batch
-may contain append-prefill; speculative decoding itself remains enabled.
-Other Ascend scheduler policies are not composed here. This module does not
+contract. Other Ascend scheduler policies are not composed here. This module does not
 install global patches or change the API server's terminal-event handling.
 """
 
@@ -1096,8 +1094,6 @@ class AsyncDecoderAppendPrefillScheduler(AsyncScheduler, DecoderAppendPrefillSch
 
 class DecoderAppendPrefillRecomputeScheduler(DecoderCacheAdmissionMixin, RecomputeScheduler):
     """Apply admission to new requests and preserve same-request KV restore."""
-
-    _allow_decode_padding = False
 
     def _is_restoring_decoder_request(self, request: Request) -> bool:
         if not request.num_preemptions:

@@ -101,7 +101,6 @@ class RecomputeScheduler(Scheduler):
     """
 
     prefill_capacity_bound: bool
-    _allow_decode_padding = True
 
     def _can_admit_local_prefix(self, request: Request, local_hits: int) -> bool:
         """Hook for decoder-local admission before connector lookup/allocation."""
@@ -670,8 +669,7 @@ class RecomputeScheduler(Scheduler):
                     # No scheduled_running_reqs check: disaggregated D nodes never mix long prefills, so padding
                     # always pays off; that check only helps colocated P/D, where prefill_scheduled still guards us.
                     if (
-                        self._allow_decode_padding
-                        and (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and not prefill_scheduled
