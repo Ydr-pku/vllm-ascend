@@ -223,6 +223,7 @@ def make_scheduler(runtime, class_name, *, prefill_interval=1, lookahead_tokens=
         speculative_config=None,
         num_speculative_tokens=0,
         num_lookahead_tokens=lookahead_tokens,
+        num_hash_lookahead_tokens=0,
         num_prefill_lookahead_tokens=1,
         max_in_flight_tokens=0,
         is_mm_encoder_only=False,
