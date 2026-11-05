@@ -471,14 +471,6 @@ def parse_args() -> argparse.Namespace:
             "A random label is used when omitted. This does not validate backend cache residency or lease."
         ),
     )
-    parser.add_argument(
-        "--disable-recomputed-retry",
-        action="store_true",
-        help=(
-            "Reject Decoder recomputation or missing Prefiller KV-transfer metadata. "
-            "Non-streaming requests return HTTP 502 instead of silently performing fallback work."
-        ),
-    )
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries for HTTP requests")
     parser.add_argument(
         "--retry-delay", type=float, default=0.001, help="Base delay (seconds) for exponential backoff retries"
@@ -835,7 +827,7 @@ async def assign_pd(
         )
         response_json = response.json()
         kv_transfer_params = response_json.get("kv_transfer_params", {})
-        if (getattr(args, "disable_recomputed_retry", False) or route_reason == "decoder_cache_miss_fallback") and not (
+        if route_reason == "decoder_cache_miss_fallback" and not (
             isinstance(kv_transfer_params, dict) and kv_transfer_params
         ):
             raise BackendContractError(
@@ -1102,15 +1094,6 @@ async def handle_completions_impl(api: str, request: Request):
                 },
             )
 
-        if getattr(args, "disable_recomputed_retry", False) and not stream_flag and preopened_first:
-            result = json.loads(preopened_first)
-            if any(choice.get("stop_reason") == "recomputed" for choice in result.get("choices", [])):
-                await preopened_gen.aclose()
-                raise BackendContractError(
-                    "Decoder requested recomputation; recomputation retry is disabled",
-                    "decoder_recomputed_retry_disabled",
-                )
-
         if route.session_reserved and route.session_id is not None:
             try:
                 await runtime.schedule(
@@ -1298,11 +1281,6 @@ async def handle_completions_impl(api: str, request: Request):
                             else (completion_tokens + usage.get("completion_tokens", 0))
                         )
                         if stop_reason == "recomputed":
-                            if getattr(args, "disable_recomputed_retry", False):
-                                raise BackendContractError(
-                                    "Decoder requested recomputation; recomputation retry is disabled",
-                                    "decoder_recomputed_retry_disabled",
-                                )
                             retry = True
                             retry_count += 1
                             if chat_flag:

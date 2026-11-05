@@ -473,62 +473,6 @@ async def test_decoder_local_recovery_reports_final_pd_route_and_cache_source(mo
         await runtime.close()
 
 
-@pytest.mark.asyncio
-async def test_fail_closed_rejects_missing_prefiller_transfer_before_decoder(monkeypatch):
-    scheduler = make_dp4_scheduler()
-    runtime, seen = install_mock_backends(monkeypatch, scheduler)
-    proxy.global_args.disable_recomputed_retry = True
-    prefiller_key = next(iter(scheduler.prefillers))
-    await runtime._clients[proxy.ServerRole.PREFILL][prefiller_key].aclose()
-    runtime._clients[proxy.ServerRole.PREFILL][prefiller_key] = httpx.AsyncClient(
-        base_url="http://127.0.0.1:8100/v1",
-        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={"choices": [{"text": "x"}]})),
-    )
-    try:
-        response = await proxy.handle_completions_impl("/completions", FakeRequest({"X-Session-ID": "fail-session"}))
-        assert response.status_code == 502
-        assert json.loads(response.body)["error"]["code"] == "missing_prefiller_kv_transfer"
-        assert not seen
-        assert scheduler.healthcheck()["request_num"] == 0
-        assert scheduler.healthcheck()["active_sessions"] == 0
-    finally:
-        await runtime.close()
-
-
-@pytest.mark.asyncio
-async def test_fail_closed_nonstream_recomputed_returns_502_without_p_retry(monkeypatch):
-    scheduler = make_dp4_scheduler()
-    runtime, seen = install_mock_backends(monkeypatch, scheduler)
-    try:
-        await consume_proxy_response(FakeRequest({"X-Session-ID": "fail-session"}))
-        proxy.global_args.disable_recomputed_retry = True
-        decoder_key = next(iter(scheduler.decoders))
-        await runtime._clients[proxy.ServerRole.DECODE][decoder_key].aclose()
-        runtime._clients[proxy.ServerRole.DECODE][decoder_key] = httpx.AsyncClient(
-            base_url="http://127.0.0.1:8200/v1",
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(
-                    200,
-                    json={"choices": [{"text": "", "stop_reason": "recomputed"}]},
-                )
-            ),
-        )
-        response = await proxy.handle_completions_impl(
-            "/completions",
-            FakeRequest(
-                {"X-Session-ID": "fail-session"},
-            ),
-        )
-        assert response.status_code == 502
-        assert json.loads(response.body)["error"]["code"] == "decoder_recomputed_retry_disabled"
-        assert len(seen) == 2  # Only the initial cold P and D were called.
-        assert scheduler.healthcheck()["request_num"] == 0
-        assert scheduler.healthcheck()["in_flight_sessions"] == 0
-        assert scheduler.session_affinities["fail-session"].turn_count == 1
-    finally:
-        await runtime.close()
-
-
 def test_expired_session_loses_old_rank_binding(monkeypatch):
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
@@ -583,7 +527,6 @@ async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stre
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
     runtime, _ = install_mock_backends(monkeypatch, scheduler)
-    proxy.global_args.disable_recomputed_retry = True
     seen = []
     streams: list[Frames] = []
     payload = {"max_tokens": 16, "cache_salt": "same-history", "stream": stream, "vllm_xargs": {"other_option": 3}}
@@ -724,7 +667,6 @@ async def test_failed_fallback_never_sends_unprefilled_request_to_d(monkeypatch,
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
     runtime, _ = install_mock_backends(monkeypatch, scheduler)
-    proxy.global_args.disable_recomputed_retry = False
     seen = []
 
     def backend(request):
