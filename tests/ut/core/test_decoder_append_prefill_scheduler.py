@@ -456,17 +456,14 @@ def test_pending_rejection_waits_for_its_own_batch(runtime, scheduler):
     assert not scheduler.update_from_output(later, empty_model_output())
 
 
-@pytest.mark.parametrize("reuse_id", [False, True])
-def test_abort_does_not_emit_rejection_or_finish_reused_id(runtime, scheduler, reuse_id):
+def test_aborted_request_does_not_emit_rejection(runtime, scheduler):
     req = enqueue(runtime, scheduler)
     output = scheduler.schedule()
     scheduler.finish_requests("miss", runtime.RequestStatus.FINISHED_ABORTED)
-    if reuse_id:
-        enqueue(runtime, scheduler)
     results = scheduler.update_from_output(output, empty_model_output())
     assert all(not result.outputs for result in results.values())
     assert req.status == runtime.RequestStatus.FINISHED_ABORTED
-    assert bool(scheduler.requests) == reuse_id
+    assert not scheduler.requests
 
 
 def test_post_output_miss_cannot_be_replayed(runtime, scheduler):

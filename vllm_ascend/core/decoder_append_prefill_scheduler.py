@@ -91,9 +91,7 @@ class DecoderCacheAdmissionMixin(_SchedulerBase):
             request_id = request.request_id
             if self._pending_decoder_cache_rejections.get(request_id) is request:
                 del self._pending_decoder_cache_rejections[request_id]
-            # Aborts may have removed the request, including reuse of its ID.
-            if self.requests.get(request_id) is request:
-                request_ids.append(request_id)
+            request_ids.append(request_id)
         for request in self.finish_requests(request_ids, RequestStatus.FINISHED_STOPPED):
             results[request.client_index].append(
                 EngineCoreOutput(
@@ -487,7 +485,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
-                # delta for decoder_append_prefill: defer requests awaiting their rejection output.
+                # delta for decoder_append_prefill: skip requests already marked for rejection.
                 if self._pending_decoder_cache_rejections.get(request_id) is request:
                     skip_request(request_queue)
                     continue
