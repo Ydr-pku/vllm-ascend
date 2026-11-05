@@ -106,9 +106,6 @@ class RecomputeScheduler(Scheduler):
         """Hook for decoder-local admission before connector lookup/allocation."""
         return True
 
-    def _get_external_prefix_cache_hit(self, request: Request, local_hits: int) -> tuple[int | None, bool]:
-        return self.connector.get_num_new_matched_tokens(request, local_hits)
-
     def _allocate_encoder_inputs(self, request: Request, input_ids: list[int], duplicate_input_ids: list[int]) -> None:
         allocate = getattr(super(), "_allocate_encoder_inputs", None)
         if allocate is not None:
@@ -581,8 +578,9 @@ class RecomputeScheduler(Scheduler):
                         # sub-block tail without racing its copy-on-write.
                         partial_tail = num_new_local_computed_tokens % self.block_size
                         block_aligned_local = num_new_local_computed_tokens - partial_tail
-                        # delta for decoder_append_prefill: let the admission policy control external KV matching.
-                        ext_tokens, load_kv_async = self._get_external_prefix_cache_hit(request, block_aligned_local)
+                        ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
+                            request, block_aligned_local
+                        )
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because

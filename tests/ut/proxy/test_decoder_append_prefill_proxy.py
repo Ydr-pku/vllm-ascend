@@ -284,6 +284,8 @@ def install_mock_backends(monkeypatch, scheduler, enabled=True):
         if request.url.port == 8100:
             result["kv_transfer_params"] = {"remote_engine_id": "fresh-engine", "remote_block_ids": [1, 2]}
             result["usage"]["prompt_tokens_details"]["cached_tokens"] = 128
+        if body.get("stream"):
+            return httpx.Response(200, stream=Frames([result]))
         return httpx.Response(200, json=result)
 
     runtime = proxy.WorkerRuntime(scheduler)
@@ -309,6 +311,71 @@ def install_mock_backends(monkeypatch, scheduler, enabled=True):
         ),
     )
     return runtime, seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("chat", [False, True])
+@pytest.mark.parametrize("warm", [False, True])
+async def test_enabled_rejects_echo_before_routing(monkeypatch, stream, chat, warm):
+    scheduler = make_dp4_scheduler()
+    if warm:
+        bind_and_finish_first_turn(scheduler)
+    original_affinities = copy.deepcopy(scheduler.session_affinities)
+    runtime, seen = install_mock_backends(monkeypatch, scheduler)
+    payload = {"echo": True, "stream": stream, "max_tokens": 64}
+    if chat:
+        payload["messages"] = [{"role": "assistant", "content": "Existing assistant prefix"}]
+        payload["continue_final_message"] = True
+    else:
+        payload["prompt"] = "complete prompt"
+    try:
+        response = await proxy.handle_completions_impl(
+            "/chat/completions" if chat else "/completions",
+            FakeRequest({"X-Session-ID": "session-1"}, payload),
+        )
+        assert response.status_code == 400
+        error = json.loads(response.body)["error"]
+        assert error["type"] == "invalid_request_error"
+        assert error["code"] == "unsupported_echo"
+        assert error["param"] == "echo"
+        assert "echo=false" in error["message"]
+        assert not seen
+        assert scheduler.request_num == 0
+        assert scheduler.session_affinities == original_affinities
+        assert scheduler.healthcheck()["in_flight_sessions"] == 0
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("chat", [False, True])
+async def test_disabled_forwards_echo_unchanged(monkeypatch, stream, chat):
+    scheduler = make_dp4_scheduler()
+    runtime, seen = install_mock_backends(monkeypatch, scheduler, enabled=False)
+    payload = {"echo": True, "stream": stream, "max_tokens": 64}
+    if chat:
+        payload["messages"] = [{"role": "assistant", "content": "Existing assistant prefix"}]
+        payload["continue_final_message"] = True
+    else:
+        payload["prompt"] = "complete prompt"
+    try:
+        response = await proxy.handle_completions_impl(
+            "/chat/completions" if chat else "/completions",
+            FakeRequest({"X-Session-ID": "session-1"}, payload),
+        )
+        assert response.status_code == 200
+        chunks = [chunk async for chunk in response.body_iterator]
+        assert chunks
+        result = json.loads(chunks[0][6:] if stream else chunks[0])
+        assert "error" not in result
+        assert [port for port, _, _ in seen] == [8100, 8200]
+        assert all(body["echo"] is True for _, _, body in seen)
+        assert scheduler.request_num == 0
+        assert not scheduler.session_affinities
+    finally:
+        await runtime.close()
 
 
 async def consume_proxy_response(request):
@@ -522,14 +589,28 @@ class Frames(httpx.AsyncByteStream):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("chat", [False, True])
-async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stream, chat):
+@pytest.mark.parametrize("echo", [None, False], ids=["echo-omitted", "echo-false"])
+@pytest.mark.parametrize(
+    "chat,token_budget",
+    [
+        pytest.param(False, {}, id="completion-default"),
+        pytest.param(False, {"max_tokens": 64}, id="completion-explicit"),
+        pytest.param(True, {}, id="chat-default"),
+        pytest.param(True, {"max_tokens": None}, id="chat-null"),
+        pytest.param(True, {"max_tokens": 64}, id="chat-max-tokens"),
+        pytest.param(True, {"max_completion_tokens": 64}, id="chat-max-completion-tokens"),
+        pytest.param(True, {"max_tokens": 32, "max_completion_tokens": 64}, id="chat-both-limits"),
+    ],
+)
+async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stream, echo, chat, token_budget):
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
     runtime, _ = install_mock_backends(monkeypatch, scheduler)
     seen = []
     streams: list[Frames] = []
-    payload = {"max_tokens": 16, "cache_salt": "same-history", "stream": stream, "vllm_xargs": {"other_option": 3}}
+    payload = {"cache_salt": "same-history", "stream": stream, "vllm_xargs": {"other_option": 3}, **token_budget}
+    if echo is not None:
+        payload["echo"] = echo
     if chat:
         payload["messages"] = [
             {"role": "user", "content": "first"},
@@ -554,14 +635,11 @@ async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stre
                     "usage": {"prompt_tokens_details": {"cached_tokens": 128}},
                 },
             )
+        content = "" if miss else "answer"
         result = {
             "choices": [
                 {
-                    ("delta" if stream else "message") if chat else "text": {"content": "" if miss else "answer"}
-                    if chat
-                    else ""
-                    if miss
-                    else "answer",
+                    ("delta" if stream else "message") if chat else "text": {"content": content} if chat else content,
                     "token_ids": [] if miss else [25],
                     "finish_reason": "stop",
                     "stop_reason": "decoder_cache_miss" if miss else None,
@@ -592,14 +670,22 @@ async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stre
         chunks = [chunk async for chunk in response.body_iterator]
         result = json.loads(chunks[0][6:] if stream else chunks[0])
         assert [port for port, _, _ in seen] == [8200, 8100, 8200]
+        output_choice = result["choices"][0]
+        output_text = output_choice["delta" if stream else "message"]["content"] if chat else output_choice["text"]
+        assert output_text == "answer"
         for port, headers, body in seen:
             assert body.get("prompt") == original.get("prompt")
             assert body.get("messages") == original.get("messages")
             assert body["cache_salt"] == original["cache_salt"]
             assert body["vllm_xargs"]["other_option"] == 3
+            assert ("echo" in body) == ("echo" in original)
+            if "echo" in original:
+                assert body["echo"] is False
             if port == 8200:
                 assert headers["x-data-parallel-rank"] == "0"
-                assert body["max_tokens"] == 16
+                assert {
+                    name: body[name] for name in ("max_tokens", "max_completion_tokens") if name in body
+                } == token_budget
         assert seen[0][2]["vllm_xargs"]["require_decoder_cache_hit"] == 1
         assert all("require_decoder_cache_hit" not in row[2]["vllm_xargs"] for row in seen[1:])
         metrics = result["proxy_metrics"]
@@ -664,7 +750,7 @@ async def test_pd_cache_miss_never_repeats_admission_fallback(monkeypatch, strea
         {"delta": {"tool_calls": [{"id": "call1"}]}},
     ],
 )
-async def test_miss_after_any_output_never_replays(monkeypatch, prior):
+async def test_cache_loss_after_output_never_replays(monkeypatch, prior):
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
     runtime, seen = install_mock_backends(monkeypatch, scheduler)
@@ -673,7 +759,7 @@ async def test_miss_after_any_output_never_replays(monkeypatch, prior):
     async def decode_stream(*args, **kwargs):
         try:
             yield b"data: " + json.dumps({"choices": [prior]}).encode() + b"\n\n"
-            yield b'data: {"choices":[{"text":"","stop_reason":"decoder_cache_miss"}]}\n\n'
+            yield b'data: {"choices":[{"text":"","stop_reason":"decoder_cache_lost_after_output"}]}\n\n'
         finally:
             closed.append(True)
 
@@ -687,7 +773,7 @@ async def test_miss_after_any_output_never_replays(monkeypatch, prior):
             ),
         )
         chunks = [c async for c in response.body_iterator]
-        assert json.loads(chunks[-1][6:])["error"]["code"] == "invalid_decoder_cache_miss"
+        assert json.loads(chunks[-1][6:])["error"]["code"] == "decoder_cache_lost_after_output"
         assert not seen  # No P call after the injected D stream.
         assert closed == [True]
         assert scheduler.request_num == 0

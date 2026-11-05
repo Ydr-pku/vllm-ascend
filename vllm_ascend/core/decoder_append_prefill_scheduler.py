@@ -10,8 +10,8 @@ required before scheduling prefill; other requests retain upstream behavior.
 The schedule body is copied from vLLM 24420b7a341af37a9bc3186e6fc6062512e0aa58:
 there is no upstream hook that can reject one waiting request and continue the
 same scheduling iteration. Feature deltas are per-step rejection bookkeeping,
-skipping pending rejections, the admission guard, and bypassing remote prefix
-matching for marked requests. DecoderAppendPrefillSchedulerCompat supplies
+skipping pending rejections, and the admission guard. Mooncake matching relies
+on transfer parameters supplied by the proxy. DecoderAppendPrefillSchedulerCompat supplies
 the v0.32.0 API adapters for this scheduling body; keep its drift test aligned.
 
 DyntraLB is currently unsupported: it requires Decoder instances to execute
@@ -104,12 +104,6 @@ class DecoderAppendPrefillSchedulerCompat(Scheduler):
             output.skip_drafts = not drafts_needed
         if hasattr(output, "encoder_input_updates"):
             output.encoder_input_updates = self._get_encoder_input_updates(scheduled, new_requests, encoder_inputs)
-        # v0.32.0 uses this worker hint; main retains it only as an empty deprecated field.
-        if not hasattr(output, "encoder_input_updates") and hasattr(output, "num_common_prefix_blocks"):
-            common_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
-            if self.running:
-                common_blocks = self.kv_cache_manager.get_num_common_prefix_blocks(self.running[0].request_id)
-            output.num_common_prefix_blocks = common_blocks
 
 
 class DecoderCacheAdmissionMixin(_SchedulerBase):
@@ -613,8 +607,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, DecoderAppendPre
                         continue
 
                     # Get externally-cached tokens if using a KVConnector.
-                    # delta for decoder_append_prefill: skip remote prefix matching for local attempts.
-                    if self.connector is not None and not self._requires_decoder_cache_hit(request):
+                    if self.connector is not None:
                         # Present a block-aligned local hit to the connector so
                         # a strictly longer remote hit can supersede a local
                         # sub-block tail without racing its copy-on-write.
@@ -1220,9 +1213,7 @@ class DecoderAppendPrefillRecomputeScheduler(DecoderCacheAdmissionMixin, Recompu
         )
 
     def _can_admit_waiting_request(self, request: Request) -> bool:
-        return self._pending_decoder_cache_rejections.get(
-            request.request_id
-        ) is not request and super()._can_admit_waiting_request(request)
+        return self._pending_decoder_cache_rejections.get(request.request_id) is not request
 
     def _can_admit_local_prefix(self, request: Request, local_hits: int) -> bool:
         if self._is_restoring_decoder_request(request):
@@ -1240,11 +1231,6 @@ class DecoderAppendPrefillRecomputeScheduler(DecoderCacheAdmissionMixin, Recompu
             # Never turn a failed restore into an implicit local full prefill.
             self._pending_decoder_cache_rejections[request.request_id] = request
             self._step_decoder_rejections.append(request)
-
-    def _get_external_prefix_cache_hit(self, request: Request, local_hits: int) -> tuple[int | None, bool]:
-        if self._requires_decoder_cache_hit(request) and not self._is_restoring_decoder_request(request):
-            return 0, False
-        return super()._get_external_prefix_cache_hit(request, local_hits)
 
     def _finish_recomputed_request(self, request: Request) -> None:
         if not self._requires_decoder_cache_hit(request):

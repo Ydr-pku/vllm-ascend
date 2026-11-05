@@ -455,13 +455,15 @@ def test_connector_cannot_rescue_a_local_miss(runtime, scheduler):
     scheduler.connector.update_state_after_alloc.assert_not_called()
 
 
-def test_marked_hit_also_bypasses_remote_matching(runtime, scheduler):
-    enqueue(runtime, scheduler, hits=16)
+def test_marked_hit_preserves_connector_matching_contract(runtime, scheduler):
+    req = enqueue(runtime, scheduler, hits=16)
     scheduler.connector = Mock(supports_divergent_local_hybrid_hits=True)
+    # Mooncake returns no external match without remote-prefill parameters.
+    scheduler.connector.get_num_new_matched_tokens.return_value = (0, False)
     scheduler.connector_prefix_cache_stats = None
     output = scheduler.schedule()
     assert output.num_scheduled_tokens == {"miss": 16}
-    scheduler.connector.get_num_new_matched_tokens.assert_not_called()
+    scheduler.connector.get_num_new_matched_tokens.assert_called_once_with(req, 16)
     scheduler.connector.update_state_after_alloc.assert_called_once()
 
 
@@ -588,8 +590,6 @@ def test_only_documented_admission_deltas_change_schedule():
             condition = ast.unparse(node.test)
             if "_pending_decoder_cache_rejections" in condition or "_should_reject_decoder_cache_miss" in condition:
                 return None
-            if "_requires_decoder_cache_hit" in condition:
-                node.test = node.test.values[0]
             return self.generic_visit(node)
 
         def visit_Call(self, node):
@@ -651,11 +651,6 @@ def test_recompute_only_adds_decoder_admission_hooks():
     return True
 '''
         ).body[0],
-        "_get_external_prefix_cache_hit": ast.parse(
-            """def _get_external_prefix_cache_hit(self, request: Request, local_hits: int) -> tuple[int | None, bool]:
-    return self.connector.get_num_new_matched_tokens(request, local_hits)
-"""
-        ).body[0],
     }
 
     class StripHooks(ast.NodeTransformer):
@@ -673,12 +668,6 @@ def test_recompute_only_adds_decoder_admission_hooks():
                 expected = ast.parse("skip_request(request_queue)\ncontinue").body
                 assert not node.orelse and canonical_ast(node.body) == canonical_ast(expected)
                 return None
-            return self.generic_visit(node)
-
-        def visit_Call(self, node):
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "_get_external_prefix_cache_hit":
-                assert ast.unparse(node) == "self._get_external_prefix_cache_hit(request, block_aligned_local)"
-                node.func = ast.parse("self.connector.get_num_new_matched_tokens", mode="eval").body
             return self.generic_visit(node)
 
     actual = StripHooks().visit(tree)
@@ -1166,6 +1155,7 @@ def test_restored_a_finishes_and_b_reuses_new_npu_blocks(runtime, combined, cach
     combined.connector = recovery_connector()
     combined.connector.update_state_before_preempt.side_effect = manager.update_state_before_preempt
     combined.connector.has_preempted_request.side_effect = manager.has_preempted_request
+    combined.connector.get_num_new_matched_tokens.side_effect = manager.get_num_new_matched_tokens
     assert combined._preempt_or_recompute(req, 1.0)
     state = manager._preempted_req_states["A"]
     # Complete the simulated D2H event before allowing the source to be reused.
@@ -1246,6 +1236,10 @@ def test_restored_a_finishes_and_b_reuses_new_npu_blocks(runtime, combined, cach
     result = combined.schedule()
     assert result.num_scheduled_tokens == ({} if evict_before_b else {"B": 16})
     assert bool(combined._pending_decoder_cache_rejections) == evict_before_b
+    if evict_before_b:
+        combined.connector.get_num_new_matched_tokens.assert_not_called()
+    else:
+        combined.connector.get_num_new_matched_tokens.assert_called_once_with(b, 32)
 
 
 @pytest.mark.parametrize("async_enabled", [False, True])
@@ -1627,10 +1621,8 @@ def test_output_fields_follow_the_installed_worker_contract(runtime, scheduler):
         # Recompute retains the existing Ascend worker-output contract.
         assert output.num_common_prefix_blocks == [0]
         scheduler.kv_cache_manager.get_num_common_prefix_blocks.assert_called_once_with(req.request_id)
-    elif hasattr(runtime.Scheduler, "_get_encoder_input_updates"):
-        assert output.encoder_input_updates == {}
+    else:
+        if hasattr(runtime.Scheduler, "_get_encoder_input_updates"):
+            assert output.encoder_input_updates == {}
         assert output.num_common_prefix_blocks == []
         scheduler.kv_cache_manager.get_num_common_prefix_blocks.assert_not_called()
-    else:
-        assert output.num_common_prefix_blocks == [0]
-        scheduler.kv_cache_manager.get_num_common_prefix_blocks.assert_called_once_with(req.request_id)

@@ -992,6 +992,19 @@ async def handle_completions_impl(api: str, request: Request):
     released_kv = False
     try:
         req_data = await request.json()
+        # delta for decoder append prefill: reject echo before session reservation or backend dispatch.
+        if args.enable_decoder_append_prefill and req_data.get("echo", False):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "Decoder append-prefill requires echo=false; omit echo or set it to false.",
+                        "type": "invalid_request_error",
+                        "param": "echo",
+                        "code": "unsupported_echo",
+                    }
+                },
+            )
         req_body = await request.body()
         request_length = len(req_body)
         try:
@@ -1105,7 +1118,6 @@ async def handle_completions_impl(api: str, request: Request):
             nonlocal request_released, released_kv
             nonlocal preopened_gen, preopened_first
             generated_token = ""
-            emitted_output = False
             gen = None
             retry_count = 0
             retry = True
@@ -1198,16 +1210,6 @@ async def handle_completions_impl(api: str, request: Request):
                         message = choice.get("message") or {}
                         content = delta.get("content") or message.get("content") or choice.get("text") or ""
                         generated_token += content
-                        emitted_output = emitted_output or bool(
-                            content
-                            or choice.get("token_ids")
-                            or delta.get("reasoning")
-                            or delta.get("reasoning_content")
-                            or delta.get("tool_calls")
-                            or message.get("tool_calls")
-                            or message.get("reasoning")
-                            or message.get("reasoning_content")
-                        )
 
                         stop_reason = choice.get("stop_reason")
                         if stop_reason == "decoder_cache_lost_after_output":
@@ -1216,7 +1218,7 @@ async def handle_completions_impl(api: str, request: Request):
                                 "decoder_cache_lost_after_output",
                             )
                         if stop_reason == "decoder_cache_miss":
-                            if instance_info.route_mode is not RouteMode.DECODER_LOCAL or emitted_output:
+                            if instance_info.route_mode is not RouteMode.DECODER_LOCAL:
                                 raise BackendContractError(
                                     "Invalid Decoder cache-miss admission response",
                                     "invalid_decoder_cache_miss",
@@ -1226,7 +1228,7 @@ async def handle_completions_impl(api: str, request: Request):
                             # prompt/history and generation budget.
                             await gen.aclose()
                             req_data.get("vllm_xargs", {}).pop("require_decoder_cache_hit", None)
-                            req_data["max_tokens"] = origin_max_tokens
+                            generated_token = ""
                             completion_tokens = 0
                             retry_count += 1
                             retry = True

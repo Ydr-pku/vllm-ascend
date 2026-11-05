@@ -12,6 +12,7 @@ The feature is opt-in in the Decoder configuration and at the proxy. It is inten
 - `scheduler_config.decoder_append_prefill_enable=true` in every Decoder's `--additional-config`. The platform selects the append-prefill admission Scheduler for its synchronous or asynchronous scheduling mode.
 - The standalone `examples/disaggregated_prefill_v1/decoder_append_prefill_proxy_server.py` proxy, started with `--enable-decoder-append-prefill`.
 - A stable session identifier and the complete conversation history on every request. The proxy retains routing affinity, not conversation messages.
+- Requests must omit `echo` or set `echo=false`. The proxy returns HTTP 400 for `echo=true` while append-prefill is enabled.
 
 ## Configure the Decode service
 
