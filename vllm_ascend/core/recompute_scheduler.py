@@ -561,6 +561,7 @@ class RecomputeScheduler(Scheduler):
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
 
+                    # delta for decoder_append_prefill: check local admission before connector lookup/allocation.
                     if not self._can_admit_local_prefix(request, num_new_local_computed_tokens):
                         skip_request(request_queue)
                         continue
@@ -572,6 +573,7 @@ class RecomputeScheduler(Scheduler):
                         # sub-block tail without racing its copy-on-write.
                         partial_tail = num_new_local_computed_tokens % self.block_size
                         block_aligned_local = num_new_local_computed_tokens - partial_tail
+                        # delta for decoder_append_prefill: let the admission policy control external KV matching.
                         ext_tokens, load_kv_async = self._get_external_prefix_cache_hit(request, block_aligned_local)
 
                         if ext_tokens is None:

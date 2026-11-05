@@ -139,6 +139,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
         self.last_prefill_step = getattr(self, "last_prefill_step", -self.local_prefill_interval)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # delta for decoder_append_prefill: collect cache-miss rejections for this step.
         rejected_requests: list[Request] = []
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -486,6 +487,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                # delta for decoder_append_prefill: defer requests awaiting their rejection output.
                 if self._pending_decoder_cache_rejections.get(request_id) is request:
                     skip_request(request_queue)
                     continue
@@ -530,6 +532,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
 
+                    # delta for decoder_append_prefill: reject local misses before connector lookup/allocation.
                     if self._should_reject_decoder_cache_miss(request, num_new_local_computed_tokens):
                         self._pending_decoder_cache_rejections[request_id] = request
                         rejected_requests.append(request)
@@ -537,6 +540,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
                         continue
 
                     # Get externally-cached tokens if using a KVConnector.
+                    # delta for decoder_append_prefill: skip remote prefix matching for local attempts.
                     if self.connector is not None and not self._requires_decoder_cache_hit(request):
                         # Present a block-aligned local hit to the connector so
                         # a strictly longer remote hit can supersede a local
@@ -1052,6 +1056,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
+        # delta for decoder_append_prefill: set the draft-skipping hint only when supported.
         # v0.32.0's output dataclass does not carry this optional worker hint.
         if hasattr(scheduler_output, "skip_drafts"):
             scheduler_output.skip_drafts = not drafts_needed
@@ -1084,6 +1089,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        # delta for decoder_append_prefill: associate rejected requests with their completing batch.
         self._record_decoder_cache_rejections(scheduler_output, rejected_requests)
         return scheduler_output
 
