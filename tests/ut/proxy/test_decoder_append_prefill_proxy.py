@@ -234,17 +234,17 @@ def test_dp_rank_round_robin_and_affinity_survives_other_sessions():
     for index in range(6):
         reservation = scheduler.reserve_session(f"session-{index}", 60)
         assert reservation["decoder_dp_rank"] == index % 4
-        assert reservation["decoder_engine_epoch"] == "decoder-test-epoch"
     assert scheduler.healthcheck()["affinity_kind"] == "proxy_hint_no_backend_lease"
 
 
-def test_restart_same_epoch_is_cold_and_epoch_change_invalidates_affinity():
+def test_proxy_restart_does_not_retain_session_affinity():
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
+    assert scheduler.reserve_session("session-1", 60)["status"] == "warm"
+
     restarted = make_dp4_scheduler()
+    assert restarted.healthcheck()["active_sessions"] == 0
     assert restarted.reserve_session("session-1", 60)["status"] == "cold"
-    scheduler.decoder_engine_epoch = "replacement-engine"
-    assert scheduler.reserve_session("session-1", 60)["status"] == "cold"
 
 
 def test_rank_validation_has_no_load_side_effect():
@@ -620,6 +620,41 @@ async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stre
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("warm", [False, True])
+async def test_pd_cache_miss_never_repeats_admission_fallback(monkeypatch, stream, warm):
+    scheduler = make_dp4_scheduler()
+    if warm:
+        bind_and_finish_first_turn(scheduler)
+    runtime, seen = install_mock_backends(monkeypatch, scheduler)
+
+    def decoder(request):
+        seen.append((request.url.port, dict(request.headers), json.loads(request.content)))
+        miss = {"choices": [{"text": "", "stop_reason": "decoder_cache_miss"}]}
+        return httpx.Response(200, stream=Frames([miss])) if stream else httpx.Response(200, json=miss)
+
+    for key, server in scheduler.decoders.items():
+        await runtime._clients[proxy.ServerRole.DECODE][key].aclose()
+        runtime._clients[proxy.ServerRole.DECODE][key] = httpx.AsyncClient(
+            base_url=proxy.build_base_url(server.host, server.port), transport=httpx.MockTransport(decoder)
+        )
+    try:
+        response = await proxy.handle_completions_impl(
+            "/completions", FakeRequest({"X-Session-ID": "session-1"}, {"prompt": [1, 2], "stream": stream})
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        result = json.loads(chunks[-1][6:] if stream else b"".join(chunks))
+        assert result["error"]["code"] == "invalid_decoder_cache_miss"
+        assert [port for port, _, _ in seen] == ([8200, 8100, 8200] if warm else [8100, 8200])
+        assert scheduler.request_num == 0
+        assert scheduler.healthcheck()["in_flight_sessions"] == 0
+        assert all(server.active_tokens == 0 for server in scheduler.decoders.values())
+        assert all(server.active_kv_cache == 0 for server in scheduler.prefillers.values())
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "prior",
     [
@@ -764,6 +799,15 @@ async def test_disconnect_waits_for_assignment_cleanup(monkeypatch, stage):
     entered = asyncio.Event()
     disconnect = asyncio.Event()
     closed = []
+    finished = []
+    schedule = runtime.schedule
+
+    async def record_finish(method, *args, **kwargs):
+        if method in {"finish_request", "finish_session"}:
+            finished.append(method)
+        return await schedule(method, *args, **kwargs)
+
+    monkeypatch.setattr(runtime, "schedule", record_finish)
 
     class Request(FakeRequest):
         async def receive(self):
@@ -800,6 +844,8 @@ async def test_disconnect_waits_for_assignment_cleanup(monkeypatch, stage):
         disconnect.set()
         await asyncio.wait_for(task, 1)
         assert closed == [stage]
+        assert finished.count("finish_request") == 1
+        assert finished.count("finish_session") == 1
         assert scheduler.healthcheck()["request_num"] == 0
         assert scheduler.healthcheck()["in_flight_sessions"] == 0
         assert all(x.active_tokens == 0 for x in scheduler.decoders.values())
@@ -1075,7 +1121,6 @@ def test_multiple_workers_share_session_owner_and_busy_guard(tmp_path, launch_mo
         assert warm["status"] == "warm"
         assert warm["decoder_key"] == owner["key"]
         assert warm["decoder_dp_rank"] == owner["dp_rank"] == 3
-        assert warm["decoder_engine_epoch"] == "startup-test"
 
         # An HTTP worker must see the reservation made by the separate Manager client.
         response = client.post(

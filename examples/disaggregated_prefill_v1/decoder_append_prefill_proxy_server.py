@@ -26,8 +26,9 @@ Session affinity alone does not prove that a prefix remains resident.
 Decoder-local append-prefill is currently unsupported with DyntraLB, which
 requires Decoder instances to execute decode-only work.
 
-The operator must change --decoder-engine-epoch and restart this proxy after
-restarting Decoders. Each Decoder endpoint's DP size must match the CLI setting.
+Restart this proxy after restarting Decoders to clear session affinity.
+--decoder-engine-epoch labels logs and responses. Each Decoder endpoint's DP
+size must match the CLI setting.
 Single-worker operation is the validated configuration; the inherited shared
 scheduler supports multiple workers but needs separate integration validation.
 SSE framing and cancellation cleanup are built in; no experiment modules or
@@ -171,7 +172,6 @@ class RoutePlan:
     session_id: str | None = None
     pinned_decoder_key: str | None = None
     pinned_decoder_dp_rank: int | None = None
-    session_reserved: bool = False
 
 
 class SessionBusyError(RuntimeError):
@@ -202,7 +202,6 @@ class SessionAffinity:
     last_access_time: float
     state: SessionState
     decoder_dp_rank: int | None = None
-    decoder_engine_epoch: str = ""
 
 
 def setup_logging(log_level: str) -> None:
@@ -301,9 +300,7 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
 
             decoder_pool = self._pool(ServerRole.DECODE)
             if affinity is not None and (
-                affinity.decoder_key not in decoder_pool.servers
-                or affinity.decoder_key in decoder_pool.tainted
-                or affinity.decoder_engine_epoch != self.decoder_engine_epoch
+                affinity.decoder_key not in decoder_pool.servers or affinity.decoder_key in decoder_pool.tainted
             ):
                 self.session_affinities.pop(session_id, None)
                 affinity = None
@@ -314,7 +311,6 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
                     turn_count=0,
                     last_access_time=now,
                     state=SessionState.IN_FLIGHT,
-                    decoder_engine_epoch=self.decoder_engine_epoch,
                 )
                 return {"status": "cold", "decoder_key": None, "turn_count": 0}
 
@@ -325,7 +321,6 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
                 "decoder_key": affinity.decoder_key,
                 "turn_count": affinity.turn_count,
                 "decoder_dp_rank": affinity.decoder_dp_rank,
-                "decoder_engine_epoch": affinity.decoder_engine_epoch,
             }
 
     def bind_session_decoder(self, session_id: str, decoder_key: str, dp_rank: int = 0) -> None:
@@ -340,7 +335,6 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
                 raise RuntimeError(f"Decoder {decoder_key} is unavailable")
             affinity.decoder_key = decoder_key
             affinity.decoder_dp_rank = dp_rank
-            affinity.decoder_engine_epoch = self.decoder_engine_epoch
             affinity.last_access_time = time.monotonic()
 
     def reset_session_binding(self, session_id: str) -> None:
@@ -467,8 +461,9 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "Operator-provided Decoder deployment label; change it and restart the proxy after a backend restart. "
-            "A random label is used when omitted. This does not validate backend cache residency or lease."
+            "Operator-provided Decoder deployment label for logs and responses; random when omitted. "
+            "Restart the proxy after a backend restart to clear session affinity. "
+            "This label does not validate backend cache residency or lease."
         ),
     )
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries for HTTP requests")
@@ -691,7 +686,6 @@ async def plan_request_route(request: Request, req_data: dict) -> RoutePlan:
             RouteMode.PD,
             "cold_session",
             session_id=session_id,
-            session_reserved=True,
         )
 
     return RoutePlan(
@@ -700,7 +694,6 @@ async def plan_request_route(request: Request, req_data: dict) -> RoutePlan:
         session_id=session_id,
         pinned_decoder_key=reservation["decoder_key"],
         pinned_decoder_dp_rank=reservation["decoder_dp_rank"],
-        session_reserved=True,
     )
 
 
@@ -904,8 +897,6 @@ async def assign_request(api: str, req_data: dict, request_length: int, route: R
     if route.mode is RouteMode.DECODER_LOCAL:
         try:
             return await assign_decoder_local(req_data, request_length, route)
-        except BackendContractError:
-            raise
         except RuntimeError:
             logger.warning(
                 "Decoder-local route for session %s lost its pinned Decoder; falling back to PD",
@@ -1019,7 +1010,7 @@ async def handle_completions_impl(api: str, request: Request):
 
         async def finish_session_once(success: bool) -> None:
             nonlocal session_finalized
-            if route.session_reserved and route.session_id is not None and not session_finalized:
+            if route.session_id is not None and not session_finalized:
                 await runtime.schedule("finish_session", route.session_id, success)
                 session_finalized = True
 
@@ -1065,11 +1056,6 @@ async def handle_completions_impl(api: str, request: Request):
         )
         try:
             preopened_first = await preopened_gen.__anext__()
-        except asyncio.CancelledError:
-            await _finish_instance(runtime, instance_info, release_prefill_kv=True)
-            request_released = True
-            await finish_session_once(False)
-            raise
         except StopAsyncIteration:
             preopened_first = b""
         except httpx.HTTPStatusError as exc:
@@ -1094,7 +1080,7 @@ async def handle_completions_impl(api: str, request: Request):
                 },
             )
 
-        if route.session_reserved and route.session_id is not None:
+        if route.session_id is not None:
             try:
                 await runtime.schedule(
                     "bind_session_decoder", route.session_id, instance_info.decoder_key, instance_info.decoder_dp_rank
@@ -1230,11 +1216,7 @@ async def handle_completions_impl(api: str, request: Request):
                                 "decoder_cache_lost_after_output",
                             )
                         if stop_reason == "decoder_cache_miss":
-                            if (
-                                instance_info.route_mode is not RouteMode.DECODER_LOCAL
-                                or retry_count > 0
-                                or emitted_output
-                            ):
+                            if instance_info.route_mode is not RouteMode.DECODER_LOCAL or emitted_output:
                                 raise BackendContractError(
                                     "Invalid Decoder cache-miss admission response",
                                     "invalid_decoder_cache_miss",
@@ -1266,7 +1248,7 @@ async def handle_completions_impl(api: str, request: Request):
                             instance_info.route_reason = "decoder_cache_miss_fallback"
                             released_kv = False
                             reported_prefiller_cached_tokens = instance_info.prefiller_cached_tokens
-                            if route.session_reserved and route.session_id is not None:
+                            if route.session_id is not None:
                                 await runtime.schedule(
                                     "bind_session_decoder",
                                     route.session_id,
@@ -1297,7 +1279,7 @@ async def handle_completions_impl(api: str, request: Request):
                             tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
                             instance_info = await reassign_instances(api, req_data, tmp_request_length, instance_info)
                             reported_prefiller_cached_tokens = instance_info.prefiller_cached_tokens
-                            if route.session_reserved and route.session_id is not None:
+                            if route.session_id is not None:
                                 await runtime.schedule(
                                     "bind_session_decoder",
                                     route.session_id,

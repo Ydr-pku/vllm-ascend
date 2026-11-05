@@ -156,7 +156,7 @@ To enable CPU KV storage and reload, follow [Preempt Offload Connector](preempt_
 - DyntraLB is unsupported because it requires decode-only Decoder work. Balance, ShortRequestFirst, profiling-chunk and batch-job policies are also not composed with the append-prefill Scheduler. ShortRequestFirst can still be configured independently on Prefill nodes.
 - The current target Decode configuration uses pipeline parallel size `1`. Combinations with profiling-based chunks or larger pipeline parallel sizes need separate admission and pipeline validation.
 - Model-specific Recompute and preempt-offload restrictions still apply; see [Preempt Offload Connector](preempt_offload_connector.md).
-- Session TTL and deployment epochs manage routing metadata. They do not pin KV, validate backend identity or provide a cache lease. Change the epoch and restart the proxy after Decoder restarts. Use one proxy worker; multi-worker integration needs separate validation.
+- Session TTL expires routing metadata. Deployment epochs label logs and responses. These values do not pin KV, validate backend identity or provide a cache lease. Restart the proxy after Decoder restarts to clear session affinity. Use one proxy worker; multi-worker integration needs separate validation.
 
 CPU regressions cover synchronous/asynchronous admission, cache-miss fallback, HTTP/SSE handling, cancellation, restore waiting and failure, in-flight output ordering, mixed-batch padding, and real CPU block-pool reuse after restoration. Device transfers and model execution are simulated in these tests. They do not establish NPU transfer correctness, model accuracy, graph behavior or performance.
 

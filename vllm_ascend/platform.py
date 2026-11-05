@@ -1900,8 +1900,6 @@ def _get_recompute_scheduler_cls(
     decoder_append_prefill: bool = False,
 ) -> str:
     if decoder_append_prefill:
-        if dyntra_lb_enabled:
-            raise ValueError("DyntraLB requires decode-only Decoders and cannot use decoder append-prefill.")
         module = "vllm_ascend.core.decoder_append_prefill_scheduler"
         name = (
             "AsyncDecoderAppendPrefillRecomputeScheduler"

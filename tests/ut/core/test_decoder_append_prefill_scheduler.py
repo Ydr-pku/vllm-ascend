@@ -1328,7 +1328,11 @@ def test_append_prefill_config_rejects_non_decoder_nodes(platform_runtime, role,
     ],
 )
 @pytest.mark.parametrize("recompute", [False, True])
-def test_append_prefill_config_rejects_conflicting_policy_before_selection(platform_runtime, policy, reason, recompute):
+def test_append_prefill_config_rejects_conflicting_policy_before_selection(
+    platform_runtime, monkeypatch, policy, reason, recompute
+):
+    selector = Mock(wraps=platform_runtime._get_recompute_scheduler_cls)
+    monkeypatch.setitem(platform_runtime._check_ascend_config.__globals__, "_get_recompute_scheduler_cls", selector)
     config, ascend_config = make_platform_config(recompute=recompute, append_prefill=True)
     policies = ascend_config.scheduler_config
     if policy == "enable_balance_scheduling":
@@ -1338,3 +1342,4 @@ def test_append_prefill_config_rejects_conflicting_policy_before_selection(platf
     with pytest.raises(ValueError, match=reason):
         platform_runtime._check_ascend_config(config, ascend_config)
     assert config.scheduler_config.scheduler_cls is None
+    selector.assert_not_called()
