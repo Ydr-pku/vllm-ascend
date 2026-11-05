@@ -137,6 +137,11 @@ def runtime(monkeypatch):
     namespace["create_request_queue"] = lambda policy: namespace["FCFSRequestQueue"]()
     execute_classes(VLLM / "v1/core/sched/scheduler.py", {"Scheduler"}, namespace)
     execute_classes(VLLM / "v1/core/sched/async_scheduler.py", {"AsyncScheduler"}, namespace)
+    # The supported release lane lacks the native encoder-update helper.
+    # Match its version gate without importing vLLM or requiring its wheel.
+    namespace["vllm_version_is"] = lambda version: version == "0.32.0" and not hasattr(
+        namespace["Scheduler"], "_get_encoder_input_updates"
+    )
     execute_classes(ROOT / "vllm_ascend/core/recompute_scheduler.py", {"SchedulerCompat"}, namespace)
     execute_classes(
         SOURCE,
@@ -586,6 +591,12 @@ def test_only_documented_admission_deltas_change_schedule(class_name):
                 node.test = node.test.values[0]
             elif "self._recomputed_reqs" in condition:
                 node.test.values.pop(1)
+            elif class_name == "RecomputeScheduler" and condition == (
+                "not vllm_version_is('0.32.0') and "
+                "(self.policy == SchedulingPolicy.PRIORITY and request.status == RequestStatus.PREEMPTED)"
+            ):
+                assert not node.orelse and len(node.body) == 1 and isinstance(node.body[0], ast.Continue)
+                node.test = node.test.values[1]
             elif class_name == "RecomputeScheduler" and "self.num_spec_tokens > 0" in condition:
                 extra = ast.parse("scheduled_running_reqs or num_computed_tokens > 0", mode="eval").body
                 node.test.values.append(extra)
@@ -1538,7 +1549,11 @@ def test_legacy_auxiliary_connector_keeps_external_load(runtime, scheduler):
     scheduler.connector.update_state_after_alloc.assert_called_once()
 
 
-def test_priority_preemption_continues_with_the_next_running_request(runtime, scheduler):
+@pytest.mark.parametrize("vllm_version", ["main", "0.32.0"])
+def test_priority_self_preemption_follows_version_policy(runtime, scheduler, monkeypatch, vllm_version):
+    monkeypatch.setitem(
+        runtime.RecomputeScheduler.schedule.__globals__, "vllm_version_is", lambda version: version == vllm_version
+    )
     first = enqueue(runtime, scheduler, "first", marked=False)
     second = enqueue(runtime, scheduler, "second", marked=False)
     scheduler.waiting = runtime.FCFSRequestQueue()
@@ -1562,8 +1577,10 @@ def test_priority_preemption_continues_with_the_next_running_request(runtime, sc
     else:
         scheduler._preempt_request = Mock(side_effect=preempt)
     output = scheduler.schedule()
-    assert output.num_scheduled_tokens == {"second": 1}
+    release_recompute = vllm_version == "0.32.0" and isinstance(scheduler, runtime.RecomputeScheduler)
+    assert output.num_scheduled_tokens == ({} if release_recompute else {"second": 1})
     assert first not in scheduler.running
+    assert second in scheduler.running
 
 
 @pytest.mark.parametrize(

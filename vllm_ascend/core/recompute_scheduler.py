@@ -48,7 +48,7 @@ from vllm_ascend.core.dyntra_lb_scheduler import (
     DyntraLBPolicyMixin,
     print_scheduler_summary,
 )
-from vllm_ascend.utils import get_ascend_config
+from vllm_ascend.utils import get_ascend_config, vllm_version_is
 
 
 def _normalize_encoder_schedule_result(
@@ -542,12 +542,13 @@ class RecomputeScheduler(SchedulerCompat):
                         break
 
             if new_blocks is None:
-                if self.policy == SchedulingPolicy.PRIORITY and request.status == RequestStatus.PREEMPTED:
+                if not vllm_version_is("0.32.0") and (
+                    self.policy == SchedulingPolicy.PRIORITY and request.status == RequestStatus.PREEMPTED
+                ):
                     # The request was the lowest-priority running request and
                     # preempted itself. The requests after it have higher
-                    # priority and may still fit (it just freed its blocks);
-                    # it was removed from `self.running`, so `req_index`
-                    # already points at the next one.
+                    # priority and may still fit; it was removed from
+                    # `self.running`, so `req_index` already points at the next.
                     continue
                 # Cannot schedule this request.
                 break
