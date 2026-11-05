@@ -7,14 +7,12 @@ via scheduler_cls. Only requests with sampling_params.extra_args containing
 require_decoder_cache_hit=1 are subject to admission. A usable local prefix is
 required before scheduling prefill; other requests retain upstream behavior.
 
-The schedule body is copied from vLLM 544f182d9f0c9bfe8bd7645525951d5e3692a542:
+The schedule body is copied from vLLM 24420b7a341af37a9bc3186e6fc6062512e0aa58:
 there is no upstream hook that can reject one waiting request and continue the
-same scheduling iteration. Schedule deltas are per-step rejection bookkeeping,
-skipping pending rejections, the admission guard, bypassing remote prefix
-matching for marked requests, and assigning the draft-skipping hint only when
-the output supports it. Initialization supplies disabled draft-skipping and
-local-prefill-cadence defaults for v0.32.0. Keep the drift test aligned when
-updating it.
+same scheduling iteration. Feature deltas are per-step rejection bookkeeping,
+skipping pending rejections, the admission guard, and bypassing remote prefix
+matching for marked requests. SchedulerCompat supplies the v0.32.0 API adapters;
+keep the drift test aligned when updating the copied scheduling body.
 
 DyntraLB is currently unsupported: it requires Decoder instances to execute
 decode-only work, while this scheduler also executes append-prefill on Decoders.
@@ -42,10 +40,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.utils import record_function_or_nullcontext
 
-from vllm_ascend.core.recompute_scheduler import RecomputeScheduler
+from vllm_ascend.core.recompute_scheduler import RecomputeScheduler, SchedulerCompat
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.scheduler import Scheduler as _SchedulerBase
+    from vllm_ascend.core.recompute_scheduler import SchedulerCompat as _SchedulerBase
 else:
     _SchedulerBase = object
 
@@ -66,12 +64,14 @@ class DecoderCacheAdmissionMixin(_SchedulerBase):
         params = request.sampling_params
         return params is not None and (params.extra_args or {}).get("require_decoder_cache_hit") == 1
 
-    def _get_local_prefix_cache_hit(self, request: Request) -> tuple[KVCacheBlocks, int, int, bool]:
+    def _get_local_prefix_cache_hit(
+        self, request: Request, max_cache_hit_length: int | None = None
+    ) -> tuple[KVCacheBlocks, int, int, bool]:
         if not self._requires_decoder_cache_hit(request):
-            return super()._get_local_prefix_cache_hit(request)
+            return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
         # Divergent hybrid hits are only valid with connector assistance. Use
         # the common resumable boundary for a strictly local request instead.
-        blocks, num_local, shared_boundary = self.kv_cache_manager.get_computed_blocks(request)
+        blocks, num_local, shared_boundary = self._get_computed_blocks(request, max_cache_hit_length)
         return blocks, num_local, shared_boundary, False
 
     def _should_reject_decoder_cache_miss(self, request: Request, local_hits: int) -> bool:
@@ -120,21 +120,11 @@ class DecoderCacheAdmissionMixin(_SchedulerBase):
         return outputs
 
 
-class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
+class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, SchedulerCompat):
     """Reject decoder-local cache misses without scheduling their prefill."""
 
     prefill_capacity_bound: bool
     last_prefill_step: int
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        # v0.32.0 has neither draft skipping nor local prefill cadence. Keep
-        # its normal draft generation and ungated prefill behavior, while
-        # preserving the values initialized by newer upstream schedulers.
-        self.can_skip_drafts = getattr(self, "can_skip_drafts", False)
-        self.local_prefill_interval = getattr(self, "local_prefill_interval", 1)
-        self.num_executed_steps = getattr(self, "num_executed_steps", 0)
-        self.last_prefill_step = getattr(self, "last_prefill_step", -self.local_prefill_interval)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # delta for decoder_append_prefill: collect cache-miss rejections for this step.
@@ -173,8 +163,6 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Whether a request scheduled this step can use the drafts proposed after
         # it. Stays set if that request is preempted later in the step.
-        # True on v0.32.0: later OR expressions short-circuit, so they never
-        # call _drafts_unused(), which that upstream version does not provide.
         drafts_needed = not self.can_skip_drafts
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
@@ -403,6 +391,13 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
                         break
 
             if new_blocks is None:
+                if self.policy == SchedulingPolicy.PRIORITY and request.status == RequestStatus.PREEMPTED:
+                    # The request was the lowest-priority running request and
+                    # preempted itself. The requests after it have higher
+                    # priority and may still fit (it just freed its blocks);
+                    # it was removed from `self.running`, so `req_index`
+                    # already points at the next one.
+                    continue
                 # Cannot schedule this request.
                 break
 
@@ -522,13 +517,22 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    if request.resumable and self.num_hash_lookahead_tokens:
+                        # Resident KV can retain a discarded streaming token's
+                        # hash. Recomputing KV must use the current token sequence.
+                        request.block_hashes.clear()
+                        request.update_block_hashes()
                     did_prefix_cache_lookup = True
+                    # delta for vllm_compat: v0.32.0 has no auxiliary cache-hit limits.
+                    max_cache_hit_length = (
+                        self._aux_output_max_cache_hit(request) if self.aux_output_connector is not None else None
+                    )
                     (
                         new_computed_blocks,
                         num_new_local_computed_tokens,
                         request.shared_prefix_boundary,
                         hit_diverged,
-                    ) = self._get_local_prefix_cache_hit(request)
+                    ) = self._get_local_prefix_cache_hit(request, max_cache_hit_length)
 
                     # delta for decoder_append_prefill: reject local misses before connector lookup/allocation.
                     if self._should_reject_decoder_cache_miss(request, num_new_local_computed_tokens):
@@ -548,7 +552,8 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
                         ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
                             request, block_aligned_local
                         )
-                        if request.skip_reading_prefix_cache:
+                        # delta for vllm_compat: normalize the renamed Request property.
+                        if self._skip_reading_external_kv(request):
                             ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
@@ -592,6 +597,16 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
                         else:
                             num_external_computed_tokens = ext_tokens
 
+                        # delta for vllm_compat: v0.32.0 has no auxiliary external-hit cap.
+                        if self.aux_output_connector is not None:
+                            num_external_computed_tokens = self._aux_output_cap_external_hit(
+                                request,
+                                num_new_local_computed_tokens,
+                                num_external_computed_tokens,
+                            )
+                            load_kv_async &= num_external_computed_tokens > 0
+
+                        # delta for vllm_compat: retain the legacy cache-manager call signature.
                         if hit_diverged and num_external_computed_tokens == 0:
                             # No external tokens back the deeper local hit, so its
                             # resume boundary would have no valid Mamba state.
@@ -600,7 +615,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
                                 new_computed_blocks,
                                 num_new_local_computed_tokens,
                                 request.shared_prefix_boundary,
-                            ) = self.kv_cache_manager.get_computed_blocks(request)
+                            ) = self._get_computed_blocks(request, max_cache_hit_length)
 
                         connector_prefix_cache_queries = request.num_tokens - num_new_local_computed_tokens
                         connector_prefix_cache_hits = num_external_computed_tokens
@@ -823,12 +838,28 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
                 # This information is used to determine if a load is
                 # needed for this request.
                 if self.connector is not None:
-                    self.connector.update_state_after_alloc(
-                        request,
-                        self.kv_cache_manager.get_blocks(request_id),
-                        num_external_computed_tokens,
+                    defer_load = (
+                        load_kv_async and self.defer_async_loads and self.sched_step_seq > self.processed_step_seq
                     )
-                    if self.connector_prefix_cache_stats is not None and connector_prefix_cache_queries != 0:
+                    if defer_load:
+                        request.last_sched_seq = self.sched_step_seq
+                        self.deferred_loads[request_id] = (
+                            self.sched_step_seq,
+                            num_external_computed_tokens,
+                            connector_prefix_cache_queries,
+                            connector_prefix_cache_hits,
+                        )
+                    else:
+                        self.connector.update_state_after_alloc(
+                            request,
+                            self.kv_cache_manager.get_blocks(request_id),
+                            num_external_computed_tokens,
+                        )
+                    if (
+                        self.connector_prefix_cache_stats is not None
+                        and connector_prefix_cache_queries != 0
+                        and not defer_load
+                    ):
                         preempted = request.num_preemptions > 0
                         self.connector_prefix_cache_stats.record(
                             num_tokens=connector_prefix_cache_queries,
@@ -871,6 +902,9 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    # delta for vllm_compat: notify auxiliary loading only when its hook exists.
+                    if self.aux_output_connector is not None:
+                        self._aux_output_request_loading(request, num_computed_tokens)
                     self._inflight_prefills.add(request)
                     self._set_kv_fetch_stage(request, KV_FETCH_IN_PROGRESS)
                     skip_request(request_queue)
@@ -1054,10 +1088,11 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
-        # delta for decoder_append_prefill: set the draft-skipping hint only when supported.
-        # v0.32.0's output dataclass does not carry this optional worker hint.
-        if hasattr(scheduler_output, "skip_drafts"):
-            scheduler_output.skip_drafts = not drafts_needed
+
+        # delta for vllm_compat: populate optional fields supported by this vLLM version.
+        self._set_optional_output_fields(
+            scheduler_output, drafts_needed, num_scheduled_tokens, new_reqs_data, scheduled_encoder_inputs
+        )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store

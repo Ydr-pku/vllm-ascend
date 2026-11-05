@@ -27,11 +27,11 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "vllm_ascend/core/decoder_append_prefill_scheduler.py"
-COPY_BASELINE_VLLM_REVISION = "544f182d9f0c9bfe8bd7645525951d5e3692a542"
+COPY_BASELINE_VLLM_REVISION = "24420b7a341af37a9bc3186e6fc6062512e0aa58"
 # Generated independently from Scheduler.schedule in the declared copy baseline.
 # The installed dependency can also be the supported v0.32.0 release, whose
 # upstream schedule legitimately differs from that main-branch snapshot.
-COPY_BASELINE_SCHEDULE_SHA256 = "0d0446b190ef0431a7b7862dd9728af2b27770c3d3b8dcb693a242cc9c75a145"
+COPY_BASELINE_SCHEDULE_SHA256 = "4bf4b86f7d7a0244cd44ee57229243a75ef093b70756cb24d739256ebf0d2480"
 VLLM = Path(os.environ.get("VLLM_SOURCE_ROOT", ROOT.parent / "vllm")) / "vllm"
 if not VLLM.is_dir():
     spec = importlib.util.find_spec("vllm")
@@ -82,6 +82,7 @@ def execute_classes(path, names, namespace):
 def runtime(monkeypatch):
     namespace: dict[str, Any] = dict(
         __name__="admission_test_runtime",
+        DyntraLBConfig=lambda **kwargs: SimpleNamespace(enable_diagnostics=False),
         ABC=ABC,
         abstractmethod=abstractmethod,
         deque=deque,
@@ -120,7 +121,13 @@ def runtime(monkeypatch):
     monkeypatch.setitem(sys.modules, module.__name__, module)
     namespace = module.__dict__
     execute_classes(VLLM / "v1/core/sched/output.py", {"SchedulerOutput"}, namespace)
-    execute_classes(VLLM / "v1/request.py", {"RequestStatus"}, namespace)
+    execute_classes(VLLM / "v1/request.py", {"RequestStatus", "Request"}, namespace)
+    namespace["NativeRequest"] = namespace["Request"]
+    namespace["Request"] = TestRequest
+    for name in ("skip_reading_external_kv", "get_max_cache_hit_length"):
+        member = getattr(namespace["NativeRequest"], name, None)
+        if member is not None:
+            monkeypatch.setattr(TestRequest, name, member, raising=False)
     execute_classes(VLLM / "v1/core/sched/interface.py", {"PauseState"}, namespace)
     execute_classes(
         VLLM / "v1/core/sched/request_queue.py",
@@ -130,14 +137,13 @@ def runtime(monkeypatch):
     namespace["create_request_queue"] = lambda policy: namespace["FCFSRequestQueue"]()
     execute_classes(VLLM / "v1/core/sched/scheduler.py", {"Scheduler"}, namespace)
     execute_classes(VLLM / "v1/core/sched/async_scheduler.py", {"AsyncScheduler"}, namespace)
+    execute_classes(ROOT / "vllm_ascend/core/recompute_scheduler.py", {"SchedulerCompat"}, namespace)
     execute_classes(
         SOURCE,
         {"DecoderCacheAdmissionMixin", "DecoderAppendPrefillScheduler", "AsyncDecoderAppendPrefillScheduler"},
         namespace,
     )
     namespace.update(
-        RecomputeSchedulerOutput=Output,
-        RecomputeReqInfo=lambda **kwargs: SimpleNamespace(**kwargs),
         FinishReason=SimpleNamespace(STOP="stop"),
         get_ascend_config=lambda: SimpleNamespace(
             finegrained_tp_config=SimpleNamespace(oproj_tensor_parallel_size=1, mlp_tensor_parallel_size=1)
@@ -146,7 +152,19 @@ def runtime(monkeypatch):
     execute_functions(
         ROOT / "vllm_ascend/core/recompute_scheduler.py", {"_normalize_encoder_schedule_result"}, namespace
     )
-    execute_classes(ROOT / "vllm_ascend/core/recompute_scheduler.py", {"RecomputeScheduler"}, namespace)
+    execute_classes(ROOT / "vllm_ascend/core/dyntra_lb_scheduler.py", {"DyntraLBPolicyMixin"}, namespace)
+    execute_classes(
+        ROOT / "vllm_ascend/core/recompute_scheduler.py",
+        {
+            "RecomputeReqInfo",
+            "RecomputeSchedulerOutput",
+            "RecomputeScheduler",
+            "AsyncRecomputeScheduler",
+            "DyntraLBRecomputeScheduler",
+            "AsyncDyntraLBRecomputeScheduler",
+        },
+        namespace,
+    )
     execute_classes(
         SOURCE,
         {"DecoderAppendPrefillRecomputeScheduler", "AsyncDecoderAppendPrefillRecomputeScheduler"},
@@ -173,6 +191,7 @@ def make_scheduler(runtime, class_name, *, prefill_interval=1, lookahead_tokens=
     # factories are faked, so release-only missing fields cannot be hidden by
     # populating an object created with __new__.
     config = SimpleNamespace(
+        additional_config={},
         scheduler_config=SimpleNamespace(
             max_num_seqs=16,
             max_num_active_seqs=None,
@@ -343,12 +362,19 @@ def enqueue(runtime, scheduler, request_id="miss", *, marked=True, hits=0, outpu
         is_prefill_chunk=True,
         use_structured_output=False,
         spec_token_ids=[],
-        skip_reading_prefix_cache=False,
+        resumable=False,
+        block_hashes=[],
+        mm_features=[],
+        req_id=request_id,
         last_sched_seq=0,
         pooling_params=None,
         stop_reason=None,
         num_nans_in_logits=0,
     )
+    if hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
+        request.prefix_cache_hit_limit = None
+    else:
+        request.skip_reading_prefix_cache = False
     scheduler.requests[request_id] = request
     scheduler.waiting.add_request(request)
     scheduler.kv_cache_manager.get_computed_blocks.return_value = (
@@ -520,7 +546,8 @@ def test_cache_miss_is_deferred_while_kv_holding_request_is_admitted(runtime, sc
     assert not scheduler.waiting and not scheduler.kv_holding_waiting and not scheduler.deferred_waiting
 
 
-def test_only_documented_admission_deltas_change_schedule():
+@pytest.mark.parametrize("class_name", ["DecoderAppendPrefillScheduler", "RecomputeScheduler"])
+def test_only_documented_admission_deltas_change_schedule(class_name):
     """Check the declared copy baseline, independently of the installed lane."""
 
     def schedule_tree(path, class_name):
@@ -529,37 +556,95 @@ def test_only_documented_admission_deltas_change_schedule():
 
     class StripAdmission(ast.NodeTransformer):
         def visit_AnnAssign(self, node):
-            if isinstance(node.target, ast.Name) and node.target.id == "rejected_requests":
+            target = ast.unparse(node.target)
+            if target in {"rejected_requests", "self._recomputed_reqs"}:
                 return None
+            return self.generic_visit(node)
+
+        def visit_Assign(self, node):
+            if ast.unparse(node.targets[0]) == "locally_preempted":
+                node.value.func.attr = "_preempt_request"
+                return ast.Expr(value=node.value)
             return self.generic_visit(node)
 
         def visit_If(self, node):
             condition = ast.unparse(node.test)
-            if "_pending_decoder_cache_rejections" in condition or "_should_reject_decoder_cache_miss" in condition:
+            if any(
+                name in condition
+                for name in (
+                    "_pending_decoder_cache_rejections",
+                    "_should_reject_decoder_cache_miss",
+                    "_can_admit_local_prefix",
+                    "_can_admit_waiting_request",
+                    "_enable_diagnostics",
+                )
+            ):
                 return None
-            if condition == "hasattr(scheduler_output, 'skip_drafts')":
-                expected = ast.parse("scheduler_output.skip_drafts = not drafts_needed").body[0]
-                assert not node.orelse
-                assert len(node.body) == 1 and ast.dump(node.body[0]) == ast.dump(expected)
-                return None
+            if condition == "locally_preempted":
+                return node.body
             if "_requires_decoder_cache_hit" in condition:
                 node.test = node.test.values[0]
+            elif "self._recomputed_reqs" in condition:
+                node.test.values.pop(1)
+            elif class_name == "RecomputeScheduler" and "self.num_spec_tokens > 0" in condition:
+                extra = ast.parse("scheduled_running_reqs or num_computed_tokens > 0", mode="eval").body
+                node.test.values.append(extra)
             return self.generic_visit(node)
 
         def visit_Call(self, node):
-            if isinstance(node.func, ast.Name) and node.func.id == "SchedulerOutput":
-                assert all(keyword.arg != "skip_drafts" for keyword in node.keywords)
-                index = next(i for i, keyword in enumerate(node.keywords) if keyword.arg == "ec_manager_metadata")
-                keyword = ast.keyword(arg="skip_drafts", value=ast.parse("not drafts_needed", mode="eval").body)
-                node.keywords.insert(index, keyword)
+            if isinstance(node.func, ast.Name) and node.func.id == "_normalize_encoder_schedule_result":
+                return self.visit(node.args[0])
+            if isinstance(node.func, ast.Name) and node.func.id in {"SchedulerOutput", "RecomputeSchedulerOutput"}:
+                node.func.id = "SchedulerOutput"
+                node.keywords = [k for k in node.keywords if k.arg != "recomputed_reqs"]
+                assert all(k.arg not in {"skip_drafts", "encoder_input_updates"} for k in node.keywords)
+                index = next(i for i, k in enumerate(node.keywords) if k.arg == "new_block_ids_to_zero")
+                node.keywords.insert(
+                    index,
+                    ast.keyword(
+                        arg="encoder_input_updates",
+                        value=ast.parse(
+                            "self._get_encoder_input_updates("
+                            "num_scheduled_tokens, new_reqs_data, scheduled_encoder_inputs)",
+                            mode="eval",
+                        ).body,
+                    ),
+                )
+                index = next(i for i, k in enumerate(node.keywords) if k.arg == "ec_manager_metadata")
+                node.keywords.insert(
+                    index, ast.keyword(arg="skip_drafts", value=ast.parse("not drafts_needed", mode="eval").body)
+                )
+            if isinstance(node.func, ast.Attribute):
+                replacements = {
+                    "_get_computed_blocks": "self.kv_cache_manager.get_computed_blocks",
+                    "_aux_output_max_cache_hit": "self.aux_output_connector.max_cache_hit",
+                    "_aux_output_cap_external_hit": "self.aux_output_connector.cap_external_hit",
+                    "_aux_output_request_loading": "self.aux_output_connector.request_loading",
+                    "_get_external_prefix_cache_hit": "self.connector.get_num_new_matched_tokens",
+                }
+                if node.func.attr == "_skip_reading_external_kv":
+                    return ast.parse("request.skip_reading_external_kv", mode="eval").body
+                if node.func.attr in replacements:
+                    node.func = ast.parse(replacements[node.func.attr], mode="eval").body
             return self.generic_visit(node)
 
         def visit_Expr(self, node):
-            if "self._record_decoder_cache_rejections(" in ast.unparse(node):
+            call = node.value
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr
+                in {
+                    "_record_decoder_cache_rejections",
+                    "_set_optional_output_fields",
+                    "_apply_load_balance_modifications",
+                }
+            ):
                 return None
             return self.generic_visit(node)
 
-    actual = StripAdmission().visit(schedule_tree(SOURCE, "DecoderAppendPrefillScheduler"))
+    path = SOURCE if class_name == "DecoderAppendPrefillScheduler" else ROOT / "vllm_ascend/core/recompute_scheduler.py"
+    actual = StripAdmission().visit(schedule_tree(path, class_name))
 
     def canonical_ast(node):
         if isinstance(node, ast.AST):
@@ -1343,3 +1428,175 @@ def test_append_prefill_config_rejects_conflicting_policy_before_selection(
         platform_runtime._check_ascend_config(config, ascend_config)
     assert config.scheduler_config.scheduler_cls is None
     selector.assert_not_called()
+
+
+def test_external_kv_skip_uses_the_installed_request_api(runtime, scheduler):
+    req = enqueue(runtime, scheduler, marked=False)
+    if hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
+        assert not hasattr(req, "skip_reading_prefix_cache")
+        req.prefix_cache_hit_limit = 0
+    else:
+        assert not hasattr(req, "skip_reading_external_kv")
+        req.skip_reading_prefix_cache = True
+    scheduler.connector = Mock(supports_divergent_local_hybrid_hits=False)
+    scheduler.connector.get_num_new_matched_tokens.return_value = (16, False)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {req.request_id: 32}
+    assert scheduler.kv_cache_manager.allocate_slots.call_args.kwargs["num_external_computed_tokens"] == 0
+
+
+@pytest.mark.parametrize("marked", [False, True])
+def test_auxiliary_cache_hit_bound_reaches_local_lookup(runtime, scheduler, marked):
+    if not hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
+        pytest.skip("v0.32.0 has no auxiliary cache-hit limits")
+    req = enqueue(runtime, scheduler, marked=marked, hits=16)
+    scheduler.aux_output_connector = Mock(max_cache_hit=Mock(return_value=16))
+    output = scheduler.schedule()
+    scheduler.kv_cache_manager.get_computed_blocks.assert_called_once_with(req, 16)
+    assert output.num_scheduled_tokens == {req.request_id: 16}
+
+
+def test_resumable_request_refreshes_hash_lookahead(runtime, scheduler):
+    if not hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
+        pytest.skip("v0.32.0 has no hash lookahead")
+    req = enqueue(runtime, scheduler, hits=16)
+    req.resumable = True
+    req.block_hashes = ["discarded-streaming-token"]
+    req.update_block_hashes = Mock(side_effect=lambda: req.block_hashes.append("current-token-sequence"))
+    scheduler.num_hash_lookahead_tokens = 1
+    scheduler.schedule()
+    req.update_block_hashes.assert_called_once_with()
+    assert req.block_hashes == ["current-token-sequence"]
+
+
+def test_auxiliary_output_caps_external_hits(runtime, scheduler):
+    if not hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
+        pytest.skip("v0.32.0 has no auxiliary cache-hit limits")
+    req = enqueue(runtime, scheduler, marked=False)
+    scheduler.connector = Mock(supports_divergent_local_hybrid_hits=False)
+    scheduler.connector.get_num_new_matched_tokens.return_value = (16, False)
+    scheduler.aux_output_connector = Mock(
+        max_cache_hit=Mock(return_value=None),
+        cap_external_hit=Mock(return_value=8),
+    )
+    output = scheduler.schedule()
+    scheduler.aux_output_connector.cap_external_hit.assert_called_once_with(req, 0, 16)
+    assert output.num_scheduled_tokens == {req.request_id: 24}
+    assert scheduler.kv_cache_manager.allocate_slots.call_args.kwargs["num_external_computed_tokens"] == 8
+
+
+def test_async_kv_load_waits_for_its_fence(runtime, scheduler):
+    if not hasattr(runtime.Scheduler, "_drain_deferred_loads"):
+        pytest.skip("v0.32.0 has no deferred async loads")
+    req = enqueue(runtime, scheduler, marked=False)
+    scheduler.connector = Mock(supports_divergent_local_hybrid_hits=False)
+    scheduler.connector.get_num_new_matched_tokens.return_value = (16, True)
+    scheduler.defer_async_loads = True
+    scheduler.sched_step_seq = 1
+    scheduler.processed_step_seq = 0
+    output = scheduler.schedule()
+    assert not output.num_scheduled_tokens
+    assert req.status is runtime.RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.connector.update_state_after_alloc.assert_not_called()
+    assert scheduler.deferred_loads[req.request_id] == (1, 16, 32, 16)
+    scheduler._drain_deferred_loads()
+    scheduler.connector.update_state_after_alloc.assert_not_called()
+    scheduler.processed_step_seq = 1
+    scheduler._drain_deferred_loads()
+    scheduler.connector.update_state_after_alloc.assert_called_once_with(
+        req,
+        scheduler.kv_cache_manager.get_blocks.return_value,
+        16,
+    )
+    assert not scheduler.deferred_loads
+
+
+def test_v2_encoder_payload_update_is_carried_to_worker(runtime, scheduler):
+    if not hasattr(runtime.Scheduler, "_get_encoder_input_updates"):
+        pytest.skip("v0.32.0 has no encoder input updates")
+    req = enqueue(runtime, scheduler, marked=False, hits=16)
+    req.has_encoder_inputs = True
+    req.mm_features = [
+        SimpleNamespace(data={"pixel_values": "cpu-payload"}, mm_position=SimpleNamespace(offset=0, length=8))
+    ]
+    scheduler.use_v2_model_runner = True
+    scheduler._try_schedule_encoder_inputs = Mock(return_value=([], 16, 0, [], []))
+    output = scheduler.schedule()
+    assert output.encoder_input_updates == {req.request_id: {0: None}}
+    assert scheduler._pending_encoder_input_ids[req.request_id] == set()
+    assert req.mm_features[0].data == {"pixel_values": "cpu-payload"}
+
+
+def test_legacy_auxiliary_connector_keeps_external_load(runtime, scheduler):
+    req = enqueue(runtime, scheduler, marked=False)
+    scheduler.connector = Mock(supports_divergent_local_hybrid_hits=False)
+    scheduler.connector.get_num_new_matched_tokens.return_value = (16, True)
+    scheduler.aux_output_connector = SimpleNamespace(build_connector_meta=Mock(return_value=None))
+    output = scheduler.schedule()
+    assert not output.num_scheduled_tokens
+    assert req.num_computed_tokens == 16
+    scheduler.connector.update_state_after_alloc.assert_called_once()
+
+
+def test_priority_preemption_continues_with_the_next_running_request(runtime, scheduler):
+    first = enqueue(runtime, scheduler, "first", marked=False)
+    second = enqueue(runtime, scheduler, "second", marked=False)
+    scheduler.waiting = runtime.FCFSRequestQueue()
+    scheduler.running = [first, second]
+    scheduler.policy = runtime.SchedulingPolicy.PRIORITY
+    for index, req in enumerate(scheduler.running):
+        req.status = runtime.RequestStatus.RUNNING
+        req.num_computed_tokens = 31
+        req.num_tokens_with_spec = 32
+        req.is_prefill_chunk = False
+        req.priority = 10 if index == 0 else 0
+        req.arrival_time = 0
+    scheduler.kv_cache_manager.allocate_slots.side_effect = [None, scheduler.kv_cache_manager.empty_kv_cache_blocks]
+
+    def preempt(req, *args, **kwargs):
+        req.status = runtime.RequestStatus.PREEMPTED
+        return True
+
+    if isinstance(scheduler, runtime.RecomputeScheduler):
+        scheduler._preempt_or_recompute = Mock(side_effect=preempt)
+    else:
+        scheduler._preempt_request = Mock(side_effect=preempt)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {"second": 1}
+    assert first not in scheduler.running
+
+
+@pytest.mark.parametrize(
+    "class_name",
+    [
+        "RecomputeScheduler",
+        "AsyncRecomputeScheduler",
+        "DyntraLBRecomputeScheduler",
+        "AsyncDyntraLBRecomputeScheduler",
+    ],
+)
+def test_existing_recompute_variants_keep_their_admission_policy(runtime, monkeypatch, class_name):
+    scheduler = make_scheduler(runtime, class_name)
+    req = enqueue(runtime, scheduler, marked=False, hits=16)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens == {req.request_id: 16}
+    scheduler = make_scheduler(runtime, class_name)
+    req = enqueue(runtime, scheduler, marked=False, hits=16)
+    admission = Mock(return_value=False)
+    monkeypatch.setattr(scheduler, "_can_admit_waiting_request", admission)
+    output = scheduler.schedule()
+    admission.assert_called_once_with(req)
+    assert not output.num_scheduled_tokens
+    scheduler.kv_cache_manager.allocate_slots.assert_not_called()
+
+
+def test_output_fields_follow_the_installed_worker_contract(runtime, scheduler):
+    req = enqueue(runtime, scheduler, marked=False, hits=16)
+    output = scheduler.schedule()
+    if hasattr(runtime.Scheduler, "_get_encoder_input_updates"):
+        assert output.encoder_input_updates == {}
+        assert output.num_common_prefix_blocks == []
+        scheduler.kv_cache_manager.get_num_common_prefix_blocks.assert_not_called()
+    else:
+        assert output.num_common_prefix_blocks == [0]
+        scheduler.kv_cache_manager.get_num_common_prefix_blocks.assert_called_once_with(req.request_id)
