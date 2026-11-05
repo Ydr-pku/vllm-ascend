@@ -44,8 +44,6 @@ For asynchronous scheduling, replace `--no-async-scheduling` with `--async-sched
 | --- | --- | --- | --- |
 | `scheduler_config.decoder_append_prefill_enable` | bool | `false` | Enables append-prefill admission and selects its Scheduler on the Decode node. |
 
-Choose the scheduling mode supported by your model and deployment. When the feature is disabled, existing Scheduler selection is unchanged. With no explicit Scheduler and no other Ascend scheduling policy, vLLM retains its native synchronous or asynchronous Scheduler.
-
 ## Start the proxy
 
 From the vLLM Ascend repository root, start the proxy with your running services. This example uses local Prefill on port `8100` and Decode on port `8200`, with Decoder DP size `1`:
@@ -66,8 +64,6 @@ python examples/disaggregated_prefill_v1/decoder_append_prefill_proxy_server.py 
 | `--enable-decoder-append-prefill` | Disabled | Enables Decoder-local routing for follow-up turns. |
 
 For a Decoder with multiple DP ranks, set `--decoder-data-parallel-size` to its actual DP size.
-
-Deployment configuration must guarantee these requirements for every Decoder, including newly added or restarted services. Recheck the backend role, prefix caching and Scheduler selection when changing the deployment. The proxy assumes the configured Decoders support append-prefill admission; it performs no capability probing at startup or before local dispatch. Model execution and streaming terminal-event compatibility also require deployment validation.
 
 ## Send a multi-turn request
 
@@ -117,13 +113,13 @@ curl -sS http://127.0.0.1:9000/v1/chat/completions \
   --data-binary @request.json
 ```
 
-The first turn establishes the Decoder owner and DP rank. A subsequent turn within the affinity lifetime attempts the same owner. Short prompts, changed tokenized prefixes, eviction or cache resets can still cause a miss and P/D fallback; the example does not guarantee a resident cache hit. Requests without a session identifier use P/D, and concurrent requests with the same session identifier are rejected while that session has an in-flight request.
+Requests without a session identifier use normal P/D. The proxy rejects a request if another request with the same session identifier is still in flight.
 
 Use `proxy_metrics.initial_route`, `final_route` and `admission_fallback` to distinguish attempted local routing from the route that completed the request. Owner, DP rank and deployment epoch are also reported. For streaming, HTTP headers describe the initial route and cannot change after streaming starts; inspect the response's `proxy_metrics` for fallback information.
 
 ## Cache misses
 
-The proxy marks local attempts with `vllm_xargs.require_decoder_cache_hit=1`. The Scheduler requires a nonzero local prefix-cache hit; remote cache availability alone does not satisfy this requirement. An initial miss emits `stop_reason="decoder_cache_miss"` with no generated output and without scheduling that request's prefill. The proxy then retries through P/D with the original history and generation budget.
+On an initial Decoder-local cache miss, the Scheduler rejects the request before prefill or output. The proxy retries through normal P/D with the complete conversation history and original generation budget.
 
 ## Optional Recompute and KV offload
 
@@ -152,12 +148,6 @@ To enable CPU KV storage and reload, follow [Preempt Offload Connector](preempt_
 
 ## Support and validation boundaries
 
-- Use P/D-disaggregated Decode nodes with `kv_consumer`. PD-mixed and ordinary non-P/D deployments are outside this feature's scope.
 - DyntraLB is unsupported because it requires decode-only Decoder work. Balance, ShortRequestFirst, profiling-chunk and batch-job policies are also not composed with the append-prefill Scheduler. ShortRequestFirst can still be configured independently on Prefill nodes.
 - The current target Decode configuration uses pipeline parallel size `1`. Combinations with profiling-based chunks or larger pipeline parallel sizes need separate admission and pipeline validation.
-- Model-specific Recompute and preempt-offload restrictions still apply; see [Preempt Offload Connector](preempt_offload_connector.md).
-- Session TTL expires routing metadata. Deployment epochs label logs and responses. These values do not pin KV, validate backend identity or provide a cache lease. Restart the proxy after Decoder restarts to clear session affinity. Use one proxy worker; multi-worker integration needs separate validation.
-
-CPU regressions cover synchronous/asynchronous admission, cache-miss fallback, HTTP/SSE handling, cancellation, restore waiting and failure, in-flight output ordering, mixed-batch padding, and real CPU block-pool reuse after restoration. Device transfers and model execution are simulated in these tests. They do not establish NPU transfer correctness, model accuracy, graph behavior or performance.
-
-Measure end-to-end completed requests, cache-hit and fallback rates, latency, and Prefill/Decode utilization with your actual model and workload. Any reduction in Prefiller work must be evaluated against the extra Decoder append-prefill load; this guide does not claim a general throughput gain or stable capacity.
+- Restart the proxy after Decoder restarts to clear session affinity. Use one proxy worker.

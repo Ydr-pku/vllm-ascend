@@ -32,6 +32,10 @@ COPY_BASELINE_VLLM_REVISION = "24420b7a341af37a9bc3186e6fc6062512e0aa58"
 # The installed dependency can also be the supported v0.32.0 release, whose
 # upstream schedule legitimately differs from that main-branch snapshot.
 COPY_BASELINE_SCHEDULE_SHA256 = "4bf4b86f7d7a0244cd44ee57229243a75ef093b70756cb24d739256ebf0d2480"
+# Preserve the existing Ascend Recompute implementation independently of the
+# vLLM copy used by DecoderAppendPrefillScheduler.
+RECOMPUTE_BASELINE_ASCEND_REVISION = "01ccef0c6cf6048246b754cfcd6051fb7c8dc9cd"
+RECOMPUTE_BASELINE_MODULE_SHA256 = "3d7707282505a11690f4c07e184489307f1a83ca8ea33f7e76811cb98a9ed67f"
 VLLM = Path(os.environ.get("VLLM_SOURCE_ROOT", ROOT.parent / "vllm")) / "vllm"
 if not VLLM.is_dir():
     spec = importlib.util.find_spec("vllm")
@@ -142,7 +146,7 @@ def runtime(monkeypatch):
     namespace["vllm_version_is"] = lambda version: version == "0.32.0" and not hasattr(
         namespace["Scheduler"], "_get_encoder_input_updates"
     )
-    execute_classes(ROOT / "vllm_ascend/core/recompute_scheduler.py", {"SchedulerCompat"}, namespace)
+    execute_classes(SOURCE, {"DecoderAppendPrefillSchedulerCompat"}, namespace)
     execute_classes(
         SOURCE,
         {"DecoderCacheAdmissionMixin", "DecoderAppendPrefillScheduler", "AsyncDecoderAppendPrefillScheduler"},
@@ -187,6 +191,11 @@ def runtime(monkeypatch):
     ]
 )
 def scheduler(runtime, request):
+    return make_scheduler(runtime, request.param)
+
+
+@pytest.fixture(params=["DecoderAppendPrefillScheduler", "AsyncDecoderAppendPrefillScheduler"])
+def ordinary_scheduler(runtime, request):
     return make_scheduler(runtime, request.param)
 
 
@@ -551,63 +560,40 @@ def test_cache_miss_is_deferred_while_kv_holding_request_is_admitted(runtime, sc
     assert not scheduler.waiting and not scheduler.kv_holding_waiting and not scheduler.deferred_waiting
 
 
-@pytest.mark.parametrize("class_name", ["DecoderAppendPrefillScheduler", "RecomputeScheduler"])
-def test_only_documented_admission_deltas_change_schedule(class_name):
-    """Check the declared copy baseline, independently of the installed lane."""
+def canonical_ast(node):
+    if isinstance(node, ast.AST):
+        # Python 3.12 added empty type_params fields to FunctionDef.
+        return [
+            type(node).__name__,
+            [(name, canonical_ast(value)) for name, value in ast.iter_fields(node) if name != "type_params" or value],
+        ]
+    if isinstance(node, list):
+        return [canonical_ast(value) for value in node]
+    return node
 
-    def schedule_tree(path, class_name):
-        cls = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.ClassDef) and n.name == class_name)
-        return next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "schedule")
+
+def test_only_documented_admission_deltas_change_schedule():
+    """Check the feature's declared copy baseline, independent of the lane."""
+    tree = ast.parse(SOURCE.read_text())
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "DecoderAppendPrefillScheduler")
+    schedule = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "schedule")
 
     class StripAdmission(ast.NodeTransformer):
         def visit_AnnAssign(self, node):
-            target = ast.unparse(node.target)
-            if target in {"rejected_requests", "self._recomputed_reqs"}:
+            if ast.unparse(node.target) == "rejected_requests":
                 return None
-            return self.generic_visit(node)
-
-        def visit_Assign(self, node):
-            if ast.unparse(node.targets[0]) == "locally_preempted":
-                node.value.func.attr = "_preempt_request"
-                return ast.Expr(value=node.value)
             return self.generic_visit(node)
 
         def visit_If(self, node):
             condition = ast.unparse(node.test)
-            if any(
-                name in condition
-                for name in (
-                    "_pending_decoder_cache_rejections",
-                    "_should_reject_decoder_cache_miss",
-                    "_can_admit_local_prefix",
-                    "_can_admit_waiting_request",
-                    "_enable_diagnostics",
-                )
-            ):
+            if "_pending_decoder_cache_rejections" in condition or "_should_reject_decoder_cache_miss" in condition:
                 return None
-            if condition == "locally_preempted":
-                return node.body
             if "_requires_decoder_cache_hit" in condition:
                 node.test = node.test.values[0]
-            elif "self._recomputed_reqs" in condition:
-                node.test.values.pop(1)
-            elif class_name == "RecomputeScheduler" and condition == (
-                "not vllm_version_is('0.32.0') and "
-                "(self.policy == SchedulingPolicy.PRIORITY and request.status == RequestStatus.PREEMPTED)"
-            ):
-                assert not node.orelse and len(node.body) == 1 and isinstance(node.body[0], ast.Continue)
-                node.test = node.test.values[1]
-            elif class_name == "RecomputeScheduler" and "self.num_spec_tokens > 0" in condition:
-                extra = ast.parse("scheduled_running_reqs or num_computed_tokens > 0", mode="eval").body
-                node.test.values.append(extra)
             return self.generic_visit(node)
 
         def visit_Call(self, node):
-            if isinstance(node.func, ast.Name) and node.func.id == "_normalize_encoder_schedule_result":
-                return self.visit(node.args[0])
-            if isinstance(node.func, ast.Name) and node.func.id in {"SchedulerOutput", "RecomputeSchedulerOutput"}:
-                node.func.id = "SchedulerOutput"
-                node.keywords = [k for k in node.keywords if k.arg != "recomputed_reqs"]
+            if isinstance(node.func, ast.Name) and node.func.id == "SchedulerOutput":
                 assert all(k.arg not in {"skip_drafts", "encoder_input_updates"} for k in node.keywords)
                 index = next(i for i, k in enumerate(node.keywords) if k.arg == "new_block_ids_to_zero")
                 node.keywords.insert(
@@ -631,7 +617,6 @@ def test_only_documented_admission_deltas_change_schedule(class_name):
                     "_aux_output_max_cache_hit": "self.aux_output_connector.max_cache_hit",
                     "_aux_output_cap_external_hit": "self.aux_output_connector.cap_external_hit",
                     "_aux_output_request_loading": "self.aux_output_connector.request_loading",
-                    "_get_external_prefix_cache_hit": "self.connector.get_num_new_matched_tokens",
                 }
                 if node.func.attr == "_skip_reading_external_kv":
                     return ast.parse("request.skip_reading_external_kv", mode="eval").body
@@ -644,39 +629,61 @@ def test_only_documented_admission_deltas_change_schedule(class_name):
             if (
                 isinstance(call, ast.Call)
                 and isinstance(call.func, ast.Attribute)
-                and call.func.attr
-                in {
-                    "_record_decoder_cache_rejections",
-                    "_set_optional_output_fields",
-                    "_apply_load_balance_modifications",
-                }
+                and call.func.attr in {"_record_decoder_cache_rejections", "_set_optional_output_fields"}
             ):
                 return None
             return self.generic_visit(node)
 
-    path = SOURCE if class_name == "DecoderAppendPrefillScheduler" else ROOT / "vllm_ascend/core/recompute_scheduler.py"
-    actual = StripAdmission().visit(schedule_tree(path, class_name))
-
-    def canonical_ast(node):
-        if isinstance(node, ast.AST):
-            # Python 3.12 added empty type_params fields to FunctionDef. Ignore
-            # that structural-only difference when checking the same source.
-            return [
-                type(node).__name__,
-                [
-                    (name, canonical_ast(value))
-                    for name, value in ast.iter_fields(node)
-                    if name != "type_params" or value
-                ],
-            ]
-        if isinstance(node, list):
-            return [canonical_ast(value) for value in node]
-        return node
-
-    docstring = ast.get_docstring(ast.parse(SOURCE.read_text()))
+    actual = StripAdmission().visit(schedule)
+    docstring = ast.get_docstring(tree)
     assert docstring is not None and COPY_BASELINE_VLLM_REVISION in docstring
     encoded = json.dumps(canonical_ast(actual), separators=(",", ":")).encode()
     assert hashlib.sha256(encoded).hexdigest() == COPY_BASELINE_SCHEDULE_SHA256
+
+
+def test_recompute_only_adds_decoder_admission_hooks():
+    """Keep unrelated Recompute scheduling and version behavior at its baseline."""
+    tree = ast.parse((ROOT / "vllm_ascend/core/recompute_scheduler.py").read_text())
+    expected_hooks = {
+        "_can_admit_local_prefix": ast.parse(
+            '''def _can_admit_local_prefix(self, request: Request, local_hits: int) -> bool:
+    """Hook for decoder-local admission before connector lookup/allocation."""
+    return True
+'''
+        ).body[0],
+        "_get_external_prefix_cache_hit": ast.parse(
+            """def _get_external_prefix_cache_hit(self, request: Request, local_hits: int) -> tuple[int | None, bool]:
+    return self.connector.get_num_new_matched_tokens(request, local_hits)
+"""
+        ).body[0],
+    }
+
+    class StripHooks(ast.NodeTransformer):
+        def visit_ClassDef(self, node):
+            if node.name == "RecomputeScheduler":
+                hooks = {n.name: n for n in node.body if isinstance(n, ast.FunctionDef) and n.name in expected_hooks}
+                assert hooks.keys() == expected_hooks.keys()
+                for name, hook in hooks.items():
+                    assert canonical_ast(hook) == canonical_ast(expected_hooks[name])
+                node.body = [n for n in node.body if not isinstance(n, ast.FunctionDef) or n.name not in expected_hooks]
+            return self.generic_visit(node)
+
+        def visit_If(self, node):
+            if ast.unparse(node.test) == ("not self._can_admit_local_prefix(request, num_new_local_computed_tokens)"):
+                expected = ast.parse("skip_request(request_queue)\ncontinue").body
+                assert not node.orelse and canonical_ast(node.body) == canonical_ast(expected)
+                return None
+            return self.generic_visit(node)
+
+        def visit_Call(self, node):
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "_get_external_prefix_cache_hit":
+                assert ast.unparse(node) == "self._get_external_prefix_cache_hit(request, block_aligned_local)"
+                node.func = ast.parse("self.connector.get_num_new_matched_tokens", mode="eval").body
+            return self.generic_visit(node)
+
+    actual = StripHooks().visit(tree)
+    encoded = json.dumps(canonical_ast(actual), separators=(",", ":")).encode()
+    assert hashlib.sha256(encoded).hexdigest() == RECOMPUTE_BASELINE_MODULE_SHA256
 
 
 @pytest.mark.parametrize("async_enabled", [False, True])
@@ -1441,7 +1448,8 @@ def test_append_prefill_config_rejects_conflicting_policy_before_selection(
     selector.assert_not_called()
 
 
-def test_external_kv_skip_uses_the_installed_request_api(runtime, scheduler):
+def test_external_kv_skip_uses_the_installed_request_api(runtime, ordinary_scheduler):
+    scheduler = ordinary_scheduler
     req = enqueue(runtime, scheduler, marked=False)
     if hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
         assert not hasattr(req, "skip_reading_prefix_cache")
@@ -1457,7 +1465,8 @@ def test_external_kv_skip_uses_the_installed_request_api(runtime, scheduler):
 
 
 @pytest.mark.parametrize("marked", [False, True])
-def test_auxiliary_cache_hit_bound_reaches_local_lookup(runtime, scheduler, marked):
+def test_auxiliary_cache_hit_bound_reaches_local_lookup(runtime, ordinary_scheduler, marked):
+    scheduler = ordinary_scheduler
     if not hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
         pytest.skip("v0.32.0 has no auxiliary cache-hit limits")
     req = enqueue(runtime, scheduler, marked=marked, hits=16)
@@ -1467,7 +1476,8 @@ def test_auxiliary_cache_hit_bound_reaches_local_lookup(runtime, scheduler, mark
     assert output.num_scheduled_tokens == {req.request_id: 16}
 
 
-def test_resumable_request_refreshes_hash_lookahead(runtime, scheduler):
+def test_resumable_request_refreshes_hash_lookahead(runtime, ordinary_scheduler):
+    scheduler = ordinary_scheduler
     if not hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
         pytest.skip("v0.32.0 has no hash lookahead")
     req = enqueue(runtime, scheduler, hits=16)
@@ -1480,7 +1490,8 @@ def test_resumable_request_refreshes_hash_lookahead(runtime, scheduler):
     assert req.block_hashes == ["current-token-sequence"]
 
 
-def test_auxiliary_output_caps_external_hits(runtime, scheduler):
+def test_auxiliary_output_caps_external_hits(runtime, ordinary_scheduler):
+    scheduler = ordinary_scheduler
     if not hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
         pytest.skip("v0.32.0 has no auxiliary cache-hit limits")
     req = enqueue(runtime, scheduler, marked=False)
@@ -1496,7 +1507,8 @@ def test_auxiliary_output_caps_external_hits(runtime, scheduler):
     assert scheduler.kv_cache_manager.allocate_slots.call_args.kwargs["num_external_computed_tokens"] == 8
 
 
-def test_async_kv_load_waits_for_its_fence(runtime, scheduler):
+def test_async_kv_load_waits_for_its_fence(runtime, ordinary_scheduler):
+    scheduler = ordinary_scheduler
     if not hasattr(runtime.Scheduler, "_drain_deferred_loads"):
         pytest.skip("v0.32.0 has no deferred async loads")
     req = enqueue(runtime, scheduler, marked=False)
@@ -1522,7 +1534,8 @@ def test_async_kv_load_waits_for_its_fence(runtime, scheduler):
     assert not scheduler.deferred_loads
 
 
-def test_v2_encoder_payload_update_is_carried_to_worker(runtime, scheduler):
+def test_v2_encoder_payload_update_is_carried_to_worker(runtime, ordinary_scheduler):
+    scheduler = ordinary_scheduler
     if not hasattr(runtime.Scheduler, "_get_encoder_input_updates"):
         pytest.skip("v0.32.0 has no encoder input updates")
     req = enqueue(runtime, scheduler, marked=False, hits=16)
@@ -1610,7 +1623,11 @@ def test_existing_recompute_variants_keep_their_admission_policy(runtime, monkey
 def test_output_fields_follow_the_installed_worker_contract(runtime, scheduler):
     req = enqueue(runtime, scheduler, marked=False, hits=16)
     output = scheduler.schedule()
-    if hasattr(runtime.Scheduler, "_get_encoder_input_updates"):
+    if isinstance(scheduler, runtime.RecomputeScheduler):
+        # Recompute retains the existing Ascend worker-output contract.
+        assert output.num_common_prefix_blocks == [0]
+        scheduler.kv_cache_manager.get_num_common_prefix_blocks.assert_called_once_with(req.request_id)
+    elif hasattr(runtime.Scheduler, "_get_encoder_input_updates"):
         assert output.encoder_input_updates == {}
         assert output.num_common_prefix_blocks == []
         scheduler.kv_cache_manager.get_num_common_prefix_blocks.assert_not_called()
