@@ -140,6 +140,26 @@ def test_decoder_removal_invalidates_affinity():
     assert "session-1" not in scheduler.session_affinities
 
 
+def test_session_ttl_reclaims_idle_metadata_without_releasing_busy_sessions(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(proxy.time, "monotonic", lambda: now)
+    scheduler = make_scheduler()
+    for session_id in ("completed-1", "completed-2"):
+        bind_and_finish_first_turn(scheduler, session_id)
+    assert scheduler.reserve_session("still-running", 60.0)["status"] == "cold"
+
+    now = 130.0
+    bind_and_finish_first_turn(scheduler, "expires-before-next-sweep")
+    now = 161.0
+    assert scheduler.reserve_session("new-session", 60.0)["status"] == "cold"
+    assert set(scheduler.session_affinities) == {"still-running", "new-session", "expires-before-next-sweep"}
+    assert scheduler.reserve_session("still-running", 60.0) == {"status": "busy"}
+
+    # A session accessed between sweeps still expires at its own TTL.
+    now = 191.0
+    assert scheduler.reserve_session("expires-before-next-sweep", 60.0)["status"] == "cold"
+
+
 def test_decoder_local_request_has_symmetric_load_accounting():
     scheduler = make_scheduler()
     decoder_key = bind_and_finish_first_turn(scheduler)
@@ -536,6 +556,77 @@ async def test_decoder_local_recovery_reports_final_pd_route_and_cache_source(mo
         assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 128
         assert [request.headers["x-data-parallel-rank"] for request in decoder_calls] == ["0", "0"]
         assert scheduler.healthcheck()["request_num"] == 0
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("admission_fallback", [False, True])
+async def test_chat_recompute_does_not_replay_with_mutated_history(monkeypatch, stream, admission_fallback):
+    scheduler = make_dp4_scheduler()
+    if admission_fallback:
+        bind_and_finish_first_turn(scheduler)
+    runtime, seen = install_mock_backends(monkeypatch, scheduler)
+    payload = {
+        "messages": [
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": "Question"},
+        ],
+        "stream": stream,
+        "max_completion_tokens": 64,
+    }
+    original = copy.deepcopy(payload)
+
+    def backend(request):
+        body = json.loads(request.content)
+        seen.append((request.url.port, dict(request.headers), body))
+        if request.url.port == 8100:
+            return httpx.Response(
+                200, json={"kv_transfer_params": {"remote_engine_id": "fresh", "remote_block_ids": [1]}}
+            )
+        local_miss = body.get("vllm_xargs", {}).get("require_decoder_cache_hit") == 1
+        result = {
+            "choices": [
+                {
+                    "delta" if stream else "message": {"content": "" if local_miss else "partial"},
+                    "stop_reason": "decoder_cache_miss" if local_miss else "recomputed",
+                }
+            ]
+        }
+        if stream:
+            frames = []
+            if not local_miss:
+                frames.append({"choices": [{"delta": {"content": "partial"}}]})
+                result["choices"][0]["delta"]["content"] = ""
+            return httpx.Response(200, stream=Frames([*frames, result]))
+        return httpx.Response(200, json=result)
+
+    for role, instances in [
+        (proxy.ServerRole.PREFILL, scheduler.prefillers),
+        (proxy.ServerRole.DECODE, scheduler.decoders),
+    ]:
+        for key, server in instances.items():
+            await runtime._clients[role][key].aclose()
+            runtime._clients[role][key] = httpx.AsyncClient(
+                base_url=proxy.build_base_url(server.host, server.port), transport=httpx.MockTransport(backend)
+            )
+    try:
+        response = await proxy.handle_completions_impl(
+            "/chat/completions", FakeRequest({"X-Session-ID": "session-1"}, payload)
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        error = json.loads(chunks[-1][6:] if stream else b"".join(chunks))["error"]
+        assert error["code"] == "chat_recompute_replay_unsupported"
+        if stream:
+            assert json.loads(chunks[0][6:])["choices"][0]["delta"]["content"] == "partial"
+        assert [port for port, _, _ in seen] == ([8200, 8100, 8200] if admission_fallback else [8100, 8200])
+        assert all(body["messages"] == original["messages"] for _, _, body in seen)
+        assert payload["messages"] == original["messages"]
+        assert scheduler.request_num == 0
+        assert scheduler.healthcheck()["in_flight_sessions"] == 0
+        assert all(server.active_tokens == 0 for server in scheduler.decoders.values())
+        assert all(server.active_kv_cache == 0 for server in scheduler.prefillers.values())
     finally:
         await runtime.close()
 
