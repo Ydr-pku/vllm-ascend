@@ -60,7 +60,6 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-# delta for decoder append prefill: reuse the P/D proxy while keeping this entry point's state separate.
 if __package__:
     from examples.disaggregated_prefill_v1 import load_balance_proxy_server_example as base_proxy
     from examples.disaggregated_prefill_v1.load_balance_proxy_server_example import ServerRole, WorkerRuntime
@@ -91,7 +90,6 @@ parse_server_addresses = base_proxy.parse_server_addresses
 logger = logging.getLogger(__name__)
 
 
-# delta for decoder append prefill: inspect complete SSE events for admission results across HTTP chunks.
 class SSEFramer:
     """Reassemble OpenAI JSON SSE events independently of HTTP chunk boundaries."""
 
@@ -140,7 +138,6 @@ class SSEFramer:
             raise ValueError("Truncated SSE stream or missing DONE")
 
 
-# delta for decoder append prefill: distinguish P/D dispatch, Decoder-local dispatch and session state.
 class RouteMode(str, Enum):
     PD = "pd"
     DECODER_LOCAL = "decoder_local"
@@ -153,7 +150,6 @@ class SessionState(str, Enum):
 
 @dataclass
 class InstanceInfo:
-    # delta for decoder append prefill: track route, session and Decoder owner; D-local has no Prefiller.
     route_mode: RouteMode
     route_reason: str
     request_id: str
@@ -169,7 +165,6 @@ class InstanceInfo:
     prefiller_cached_tokens: int | None = None
 
 
-# delta for decoder append prefill: carry the reserved session and pinned Decoder/rank into dispatch.
 @dataclass
 class RoutePlan:
     mode: RouteMode
@@ -183,7 +178,6 @@ class SessionBusyError(RuntimeError):
     pass
 
 
-# delta for decoder append prefill: fail requests that violate cache-admission or fallback contracts.
 class BackendContractError(RuntimeError):
     """The backend violated the routing contract; do not count this response as success."""
 
@@ -201,7 +195,6 @@ shared_scheduler: "SharedProxyScheduler | None" = None
 runtime: "WorkerRuntime | None" = None
 
 
-# delta for decoder append prefill: retain owner/rank and lifecycle metadata, not conversation history.
 @dataclass
 class SessionAffinity:
     decoder_key: str | None
@@ -216,7 +209,6 @@ def setup_logging(log_level: str) -> None:
     logger.setLevel(getattr(logging, log_level.upper()))
 
 
-# delta for decoder append prefill: extend the existing load scheduler with session ownership.
 class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
     """Add session ownership to the shared P/D proxy's load scheduler."""
 
@@ -239,7 +231,6 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
         self._last_session_cleanup_time = 0.0
 
     def healthcheck(self) -> dict[str, Any]:
-        # delta for decoder append prefill: expose session counts, DP size and the deployment label.
         with self._lock:
             return {
                 **super().healthcheck(),
@@ -258,7 +249,6 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
             return self._with_decoder_owner(decoder, None)
 
     def _with_decoder_owner(self, decoder: dict[str, Any], dp_rank: int | None) -> dict[str, Any]:
-        # delta for decoder append prefill: round-robin new owners within each endpoint; retain pinned ranks.
         key = decoder["key"]
         if dp_rank is None:
             dp_rank = self._next_decoder_dp_rank.get(key, 0)
@@ -275,7 +265,6 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
 
     def reserve_decoder(self, key: str, load: float, dp_rank: int | None = None) -> dict[str, Any]:
         """Reserve load on a specific, non-tainted Decoder."""
-        # delta for decoder append prefill: charge load to the pinned Decoder instead of choosing another.
         with self._lock:
             if dp_rank is not None:
                 self._validate_decoder_dp_rank(dp_rank)
@@ -301,10 +290,9 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
         not proof of a prefix-cache hit; the Decoder Scheduler remains the
         authority for actual matched tokens.
         """
-        # delta for decoder append prefill: serialize each session and discard expired/unavailable owners.
         with self._lock:
             now = time.monotonic()
-            # delta for decoder append prefill: reclaim expired idle session affinities that never return.
+            # Reclaim expired idle sessions, including those that never return.
             # Sweep at most once per TTL; active requests keep their busy guard.
             if now - self._last_session_cleanup_time >= ttl_seconds:
                 expired = [
@@ -349,7 +337,6 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
 
     def bind_session_decoder(self, session_id: str, decoder_key: str, dp_rank: int = 0) -> None:
         """Bind an accepted request to its Decoder and rank; retain proxy serialization."""
-        # delta for decoder append prefill: commit the selected endpoint and rank while the session stays busy.
         with self._lock:
             self._validate_decoder_dp_rank(dp_rank)
             affinity = self.session_affinities.get(session_id)
@@ -372,7 +359,6 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
 
     def finish_session(self, session_id: str, success: bool) -> None:
         """Commit or roll back a reserved session after response completion."""
-        # delta for decoder append prefill: release session serialization and retain only usable bindings.
         with self._lock:
             affinity = self.session_affinities.get(session_id)
             if affinity is None:
@@ -393,7 +379,6 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
             affinity.last_access_time = time.monotonic()
 
     def invalidate_all_sessions(self) -> None:
-        # delta for decoder append prefill: clear all session affinities after a backend prefix-cache reset.
         with self._lock:
             self.session_affinities.clear()
 
@@ -408,7 +393,6 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
         keys = {server_key(host, port) for host, port in instances}
         with self._lock:
             if role is ServerRole.DECODE:
-                # delta for decoder append prefill: invalidate only sessions owned by the removed Decoders.
                 self._invalidate_decoder_sessions_no_lock(keys)
             return super().remove_instances(role, instances)
 
@@ -478,7 +462,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefiller-ports", type=int, nargs="+", default=[8001])
     parser.add_argument("--decoder-hosts", type=str, nargs="+", default=["localhost"])
     parser.add_argument("--decoder-ports", type=int, nargs="+", default=[8002])
-    # delta for decoder append prefill: configure each Decoder's internal DP size and deployment label.
     parser.add_argument(
         "--decoder-data-parallel-size",
         type=int,
@@ -521,7 +504,6 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Log level for the proxy server.",
     )
-    # delta for decoder append prefill: opt in to local routing and configure idle session expiry.
     parser.add_argument(
         "--enable-decoder-append-prefill",
         action="store_true",
@@ -570,7 +552,6 @@ def bootstrap_parent_process(args: argparse.Namespace) -> None:
     if args.workers <= 1:
         return
 
-    # delta for decoder append prefill: share the owner-aware scheduler and DP/epoch settings across workers.
     shared_scheduler = SharedProxyScheduler(
         args.prefiller_instances,
         args.decoder_instances,
@@ -592,7 +573,6 @@ def _ensure_scheduler(args) -> SharedProxyScheduler:
     global shared_scheduler
     if shared_scheduler is not None:
         return shared_scheduler
-    # delta for decoder append prefill: use the same owner-aware scheduler in single-worker mode.
     shared_scheduler = SharedProxyScheduler(
         args.prefiller_instances,
         args.decoder_instances,
@@ -635,7 +615,6 @@ def create_app():
     return app
 
 
-# delta for decoder append prefill: drain cancelled tasks and finalize responses not handed to the client.
 def with_cancellation(handler_func):
     @functools.wraps(handler_func)
     async def wrapper(*args, **kwargs):
@@ -674,13 +653,11 @@ def with_cancellation(handler_func):
     return wrapper
 
 
-# delta for decoder append prefill: send the proxy-selected DP rank instead of accepting a client override.
 def decoder_headers(request_id: str, decoder_dp_rank: int) -> dict[str, str]:
     """Create trusted backend headers; no incoming client rank/header is forwarded."""
     return {**auth_headers(request_id), DP_RANK_HEADER: str(decoder_dp_rank)}
 
 
-# delta for decoder append prefill: report the initial route, owner, DP rank and deployment label.
 def routing_response_headers(info: InstanceInfo) -> dict[str, str]:
     return {
         "X-Request-Id": info.request_id,
@@ -692,12 +669,10 @@ def routing_response_headers(info: InstanceInfo) -> dict[str, str]:
     }
 
 
-# delta for decoder append prefill: send cold/no-ID requests through P/D and warm sessions to their owner.
 async def plan_request_route(request: Request, req_data: dict) -> RoutePlan:
     """Reserve session affinity and choose PD or Decoder-local routing."""
     args = get_global_args()
     body_session_id = req_data.pop("conversation_id", None)
-    # delta for decoder append prefill: let the proxy control transfer metadata and cache-hit admission.
     # Client-supplied transfer metadata can refer to expired P allocations. Only
     # assign_pd may attach the metadata returned by the current P request.
     req_data.pop("kv_transfer_params", None)
@@ -757,7 +732,6 @@ async def stream_service_response(
                     await response.aread()
                     response.raise_for_status()
                 if not req_data.get("stream", False):
-                    # delta for decoder append prefill: inspect a complete JSON response for admission errors.
                     # A non-streaming JSON document may cross HTTP chunk
                     # boundaries. Buffer it before committing proxy headers so
                     # route metrics and fail-closed checks see a whole document.
@@ -765,7 +739,6 @@ async def stream_service_response(
                     first_chunk_sent = True
                     yield body
                     return
-                # delta for decoder append prefill: frame SSE before routing checks; received bytes forbid retry.
                 framer = SSEFramer()
                 async for chunk in response.aiter_bytes():
                     # Never retry after receiving bytes, even an incomplete event.
@@ -807,7 +780,6 @@ async def _finish_instance(runtime: WorkerRuntime, info: InstanceInfo, *, releas
     )
 
 
-# delta for decoder append prefill: preserve the session's D/rank on P/D fallback, rebinding if unavailable.
 async def _reserve_pd_decoder(
     runtime: WorkerRuntime,
     decoder_score: float,
@@ -860,7 +832,6 @@ async def assign_pd(
         )
         response_json = response.json()
         kv_transfer_params = response_json.get("kv_transfer_params", {})
-        # delta for decoder append prefill: require fresh P transfer metadata before a cache-miss fallback's D leg.
         if route_reason == "decoder_cache_miss_fallback" and not (
             isinstance(kv_transfer_params, dict) and kv_transfer_params
         ):
@@ -896,7 +867,6 @@ async def assign_pd(
             prefiller_cached_tokens=prefiller_cached_tokens,
         )
     except (Exception, asyncio.CancelledError):
-        # delta for decoder append prefill: shield reservation rollback from cancellation during P/D assignment.
         with anyio.CancelScope(shield=True):
             if decoder is not None:
                 await runtime.schedule("release_decoder", decoder["key"], decoder_score)
@@ -906,7 +876,6 @@ async def assign_pd(
         raise
 
 
-# delta for decoder append prefill: bypass P and require a real local cache hit on the pinned D/rank.
 async def assign_decoder_local(
     req_data: dict,
     request_length: int,
@@ -936,7 +905,6 @@ async def assign_decoder_local(
     )
 
 
-# delta for decoder append prefill: dispatch the route plan and fall back to P/D if its owner disappears.
 async def assign_request(api: str, req_data: dict, request_length: int, route: RoutePlan) -> InstanceInfo:
     if route.mode is RouteMode.DECODER_LOCAL:
         try:
@@ -972,7 +940,6 @@ async def reassign_instances(
     route_reason: str = "recomputed_fallback",
 ) -> InstanceInfo:
     runtime = get_runtime()
-    # delta for decoder append prefill: D-local has no P reservation; retain owner/rank through reassignment.
     if previous_instance.prefiller_key is not None:
         await runtime.schedule("release_prefill_kv", previous_instance.prefiller_key, previous_instance.prefiller_score)
         previous_instance.prefiller_key = None
@@ -1006,11 +973,9 @@ async def _replay_first_chunk(first_chunk: bytes, gen: Any):
         async for chunk in gen:
             yield chunk
     finally:
-        # delta for decoder append prefill: close the underlying stream when replay is cancelled or abandoned.
         await gen.aclose()
 
 
-# delta for decoder append prefill: release reservations even if the response body iterator never starts.
 class CleanupStreamingResponse(StreamingResponse):
     """Retain cleanup ownership even when the body iterator never starts."""
 
@@ -1054,7 +1019,6 @@ async def handle_completions_impl(api: str, request: Request):
             )
         req_body = await request.body()
         request_length = len(req_body)
-        # delta for decoder append prefill: reserve the session before assignment; reject concurrent turns with 409.
         try:
             route = await plan_request_route(request, req_data)
         except SessionBusyError as exc:
@@ -1069,7 +1033,6 @@ async def handle_completions_impl(api: str, request: Request):
                 },
             )
 
-        # delta for decoder append prefill: finalize the session once across normal, error and cancellation paths.
         async def finish_session_once(success: bool) -> None:
             nonlocal session_finalized
             if route.session_id is not None and not session_finalized:
@@ -1091,7 +1054,13 @@ async def handle_completions_impl(api: str, request: Request):
         initial_route = instance_info.route_mode.value
         chat_flag = "messages" in req_data
 
-        origin_prompt = req_data.get("prompt", "")
+        if "prompt" in req_data:
+            origin_prompt = req_data["prompt"]
+        elif chat_flag:
+            messages = req_data["messages"]
+            origin_prompt = messages[0].get("content", "")
+        else:
+            origin_prompt = ""
         origin_max_tokens = req_data.get("max_tokens", 16)
 
         # Pre-open the decode response BEFORE committing the ASGI 200 head so an
@@ -1136,7 +1105,6 @@ async def handle_completions_impl(api: str, request: Request):
                 },
             )
 
-        # delta for decoder append prefill: bind the accepted Decoder/rank before exposing its response.
         if route.session_id is not None:
             try:
                 await runtime.schedule(
@@ -1177,7 +1145,6 @@ async def handle_completions_impl(api: str, request: Request):
                     )
                     released_kv = True
 
-            # delta for decoder append prefill: D-local requests never hold a Prefiller KV reservation.
             released_kv = instance_info.prefiller_key is None
 
             try:
@@ -1223,7 +1190,6 @@ async def handle_completions_impl(api: str, request: Request):
                         # changed after streaming starts. The final JSON (or
                         # parsed SSE chunks) records any recompute recovery so
                         # clients can distinguish P fallback from D-local reuse.
-                        # delta for decoder append prefill: expose final route/fallback and cached-token provenance.
                         chunk_json["proxy_metrics"] = {
                             "initial_route": initial_route,
                             "final_route": instance_info.route_mode.value,
@@ -1248,7 +1214,6 @@ async def handle_completions_impl(api: str, request: Request):
                             if update_cached_tokens_in_chunk(chunk_json, reported_prefiller_cached_tokens):
                                 chunk = encode_response_chunk(chunk_json, is_sse)
                             if not choices:
-                                # delta for decoder append prefill: preserve usage-only events with no choices.
                                 yield chunk
                                 continue
 
@@ -1259,13 +1224,11 @@ async def handle_completions_impl(api: str, request: Request):
                         generated_token += content
 
                         stop_reason = choice.get("stop_reason")
-                        # delta for decoder append prefill: cache loss after output must fail without replay.
                         if stop_reason == "decoder_cache_lost_after_output":
                             raise BackendContractError(
                                 "Decoder lost KV after output; replay would duplicate tokens",
                                 "decoder_cache_lost_after_output",
                             )
-                        # delta for decoder append prefill: only a zero-output local miss may retry via P/D.
                         if stop_reason == "decoder_cache_miss":
                             if instance_info.route_mode is not RouteMode.DECODER_LOCAL:
                                 raise BackendContractError(
@@ -1314,22 +1277,22 @@ async def handle_completions_impl(api: str, request: Request):
                             else (completion_tokens + usage.get("completion_tokens", 0))
                         )
                         if stop_reason == "recomputed":
-                            if chat_flag:
-                                raise BackendContractError(
-                                    "Chat KV recovery requires replay; resubmit the complete conversation "
-                                    "after handling the failed turn.",
-                                    "chat_recompute_replay_unsupported",
-                                )
                             retry = True
                             retry_count += 1
-                            req_data["prompt"] = origin_prompt + generated_token
+                            if chat_flag:
+                                messages[0]["content"] = (
+                                    origin_prompt
+                                    + ([{"type": "text", "text": generated_token}] if generated_token else [])
+                                    if isinstance(origin_prompt, list)
+                                    else (origin_prompt or "") + generated_token
+                                )
+                            else:
+                                req_data["prompt"] = origin_prompt + generated_token
                             req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
-                            # delta for decoder append prefill: clear local admission for existing recomputed recovery.
                             (req_data.get("vllm_xargs") or {}).pop("require_decoder_cache_hit", None)
                             tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
                             instance_info = await reassign_instances(api, req_data, tmp_request_length, instance_info)
                             reported_prefiller_cached_tokens = instance_info.prefiller_cached_tokens
-                            # delta for decoder append prefill: refresh session ownership after recomputed recovery.
                             if route.session_id is not None:
                                 await runtime.schedule(
                                     "bind_session_decoder",
@@ -1366,7 +1329,6 @@ async def handle_completions_impl(api: str, request: Request):
                 )
                 raise
             except BackendContractError as exc:
-                # delta for decoder append prefill: surface admission/fallback contract failures as routing errors.
                 logger.error("Request %s failed routing gate: %s", instance_info.request_id, exc)
                 yield encode_response_chunk(
                     {
@@ -1396,7 +1358,6 @@ async def handle_completions_impl(api: str, request: Request):
                     stream_flag,
                 )
             finally:
-                # delta for decoder append prefill: shield stream, load and session cleanup on every exit.
                 with anyio.CancelScope(shield=True):
                     try:
                         try:
@@ -1420,7 +1381,6 @@ async def handle_completions_impl(api: str, request: Request):
 
         media_type = "text/event-stream; charset=utf-8" if stream_flag else "application/json"
 
-        # delta for decoder append prefill: also clean up a preopened response whose body is never consumed.
         async def finalize_response_once():
             nonlocal request_released, released_kv
             try:
@@ -1442,7 +1402,6 @@ async def handle_completions_impl(api: str, request: Request):
             headers=routing_response_headers(instance_info),
         )
     except asyncio.CancelledError:
-        # delta for decoder append prefill: release assignments and the session if cancelled before body handoff.
         with anyio.CancelScope(shield=True):
             try:
                 if "preopened_gen" in locals() and preopened_gen is not None:
@@ -1592,7 +1551,6 @@ async def reset_prefix_cache(request: Request):
         except Exception as e:
             logger.error("reset_prefix_cache failed for %s: %s", base_url, e)
             failures.append(base_url)
-    # delta for decoder append prefill: discard owner hints after resetting backend prefix caches.
     runtime.scheduler.invalidate_all_sessions()
     if failures:
         return JSONResponse(status_code=500, content={"failed": failures})

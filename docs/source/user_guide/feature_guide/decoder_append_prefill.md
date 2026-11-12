@@ -115,7 +115,7 @@ curl -sS http://127.0.0.1:9000/v1/chat/completions \
   --data-binary @request.json
 ```
 
-Requests without a session identifier use normal P/D. The proxy returns HTTP 409 (`session_busy`) if another request with the same session identifier is still in flight.
+Requests without a session identifier use normal P/D. The proxy rejects a request if another request with the same session identifier is still in flight.
 
 Use `proxy_metrics.initial_route`, `final_route` and `admission_fallback` to distinguish attempted local routing from the route that completed the request. Owner, DP rank and deployment epoch are also reported. For streaming, HTTP headers describe the initial route and cannot change after streaming starts; inspect the response's `proxy_metrics` for fallback information.
 
@@ -132,8 +132,6 @@ The combined append-prefill/Recompute Scheduler coordinates KV recovery with the
 - **Resuming the same request:** If the connector still has offload recovery state for the preempted request, the Scheduler allows it to wait for KV storage and restoration, even when its NPU-local prefix is no longer resident. It is not immediately rejected as a cache miss.
 - **Admitting a new follow-up turn:** A later request in the same session still needs a usable prefix on its owner Decoder. A CPU copy alone does not satisfy this requirement. Once restored KV is resident on the Decoder, later turns can reuse it through normal prefix caching.
 - **Handling failed recovery:** The request follows the feature's fallback or termination handling. Failed recovery does not silently turn a Decoder-local request into a full prefill on the Decoder.
-
-Chat requests support same-request KV restoration. If recovery instead requires replaying generated text (`stop_reason="recomputed"`), the proxy returns `chat_recompute_replay_unsupported` and ends the turn. It cannot reconstruct a chat continuation by editing the supplied messages. Handle the failed turn in the client before resubmitting the complete conversation; streaming clients may already have received partial output.
 
 To enable the combined Scheduler, configure both options in the Decode service's `--additional-config`:
 
