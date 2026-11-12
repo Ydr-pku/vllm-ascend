@@ -1160,14 +1160,6 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
     if decoder_append:
         # Fail before Ascend policy selection can overwrite cache admission.
         _validate_decoder_append_prefill_policies(vllm_config, scheduler_extension_config)
-    if decoder_append_enabled:
-        kv_transfer_config = vllm_config.kv_transfer_config
-        kv_role = getattr(kv_transfer_config, "kv_role", None)
-        if kv_transfer_config is None or kv_role != "kv_consumer":
-            raise ValueError(
-                "Decoder append-prefill is only supported on PD-disaggregated D nodes "
-                f"(kv_role='kv_consumer', but got kv_role={kv_role!r})."
-            )
 
     # enable_balance_scheduling: only supported in PD-mixed mode
     if scheduler_extension_config.enable_balance_scheduling:
@@ -1872,6 +1864,14 @@ def _validate_decoder_append_prefill_policies(vllm_config, config) -> None:
         raise ValueError(
             "Decoder append-prefill is incompatible with these currently unsupported policies: " + "; ".join(conflicts)
         )
+    if config.decoder_append_prefill_enable:
+        kv_transfer_config = vllm_config.kv_transfer_config
+        kv_role = getattr(kv_transfer_config, "kv_role", None)
+        if kv_transfer_config is None or kv_role != "kv_consumer":
+            raise ValueError(
+                "Decoder append-prefill is only supported on PD-disaggregated D nodes "
+                f"(kv_role='kv_consumer', but got kv_role={kv_role!r})."
+            )
     selected = vllm_config.scheduler_config.scheduler_cls
     if not _is_decoder_append_prefill_scheduler(selected):
         return

@@ -142,8 +142,12 @@ class DecoderCacheAdmissionMixin(_SchedulerBase):
     def _should_reject_decoder_cache_miss(self, request: Request, local_hits: int) -> bool:
         return self._requires_decoder_cache_hit(request) and local_hits <= 0
 
+    def _is_pending_decoder_cache_rejection(self, request: Request) -> bool:
+        return self._pending_decoder_cache_rejections.get(request.request_id) is request
+
     def _record_decoder_cache_rejections(self, output: SchedulerOutput, requests: list[Request]) -> None:
         if requests:
+            # Each schedule call creates a new list; retain this batch's list until completion.
             self._decoder_cache_rejection_batches[id(output)] = requests
 
     def _finish_decoder_cache_rejections(self, output: SchedulerOutput) -> dict[int, list[EngineCoreOutput]]:
@@ -193,7 +197,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, DecoderAppendPre
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # delta for decoder_append_prefill: collect cache-miss rejections for this step.
-        rejected_requests: list[Request] = []
+        self.rejected_requests: list[Request] = []
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -546,7 +550,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, DecoderAppendPre
                 request = request_queue.peek_request()
                 request_id = request.request_id
                 # delta for decoder_append_prefill: skip requests already marked for rejection.
-                if self._pending_decoder_cache_rejections.get(request_id) is request:
+                if self._is_pending_decoder_cache_rejection(request):
                     skip_request(request_queue)
                     continue
 
@@ -602,7 +606,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, DecoderAppendPre
                     # delta for decoder_append_prefill: reject local misses before connector lookup/allocation.
                     if self._should_reject_decoder_cache_miss(request, num_new_local_computed_tokens):
                         self._pending_decoder_cache_rejections[request_id] = request
-                        rejected_requests.append(request)
+                        self.rejected_requests.append(request)
                         skip_request(request_queue)
                         continue
 
@@ -1187,7 +1191,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, DecoderAppendPre
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         # delta for decoder_append_prefill: associate rejected requests with their completing batch.
-        self._record_decoder_cache_rejections(scheduler_output, rejected_requests)
+        self._record_decoder_cache_rejections(scheduler_output, self.rejected_requests)
         return scheduler_output
 
 
@@ -1212,15 +1216,15 @@ class DecoderAppendPrefillRecomputeScheduler(DecoderCacheAdmissionMixin, Recompu
             if (hook := getattr(connector, "has_preempted_request", None)) is not None
         )
 
-    def _can_admit_waiting_request(self, request: Request) -> bool:
-        return self._pending_decoder_cache_rejections.get(request.request_id) is not request
+    def _can_admit_decoder_waiting_request(self, request: Request) -> bool:
+        return not self._is_pending_decoder_cache_rejection(request)
 
     def _can_admit_local_prefix(self, request: Request, local_hits: int) -> bool:
         if self._is_restoring_decoder_request(request):
             return True
         if self._should_reject_decoder_cache_miss(request, local_hits):
             self._pending_decoder_cache_rejections[request.request_id] = request
-            self._step_decoder_rejections.append(request)
+            self.rejected_requests.append(request)
             return False
         return True
 
@@ -1230,7 +1234,7 @@ class DecoderAppendPrefillRecomputeScheduler(DecoderCacheAdmissionMixin, Recompu
         if failed and self._requires_decoder_cache_hit(request):
             # Never turn a failed restore into an implicit local full prefill.
             self._pending_decoder_cache_rejections[request.request_id] = request
-            self._step_decoder_rejections.append(request)
+            self.rejected_requests.append(request)
 
     def _finish_recomputed_request(self, request: Request) -> None:
         if not self._requires_decoder_cache_hit(request):
@@ -1240,12 +1244,12 @@ class DecoderAppendPrefillRecomputeScheduler(DecoderCacheAdmissionMixin, Recompu
         # whether replay is safe. Upstream preemption fences KV block freeing.
         Scheduler._preempt_request(self, request, time.monotonic(), drop_stale_output=self.requires_kv_delivery)
         self._pending_decoder_cache_rejections[request.request_id] = request
-        self._step_decoder_rejections.append(request)
+        self.rejected_requests.append(request)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        self._step_decoder_rejections: list[Request] = []
+        self.rejected_requests: list[Request] = []
         output = super().schedule(throttle_prefills)
-        self._record_decoder_cache_rejections(output, self._step_decoder_rejections)
+        self._record_decoder_cache_rejections(output, self.rejected_requests)
         return output
 
 

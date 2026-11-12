@@ -582,13 +582,13 @@ def test_only_documented_admission_deltas_change_schedule():
 
     class StripAdmission(ast.NodeTransformer):
         def visit_AnnAssign(self, node):
-            if ast.unparse(node.target) == "rejected_requests":
+            if ast.unparse(node.target) == "self.rejected_requests":
                 return None
             return self.generic_visit(node)
 
         def visit_If(self, node):
             condition = ast.unparse(node.test)
-            if "_pending_decoder_cache_rejections" in condition or "_should_reject_decoder_cache_miss" in condition:
+            if "_is_pending_decoder_cache_rejection" in condition or "_should_reject_decoder_cache_miss" in condition:
                 return None
             return self.generic_visit(node)
 
@@ -645,6 +645,12 @@ def test_recompute_only_adds_decoder_admission_hooks():
     """Keep unrelated Recompute scheduling and version behavior at its baseline."""
     tree = ast.parse((ROOT / "vllm_ascend/core/recompute_scheduler.py").read_text())
     expected_hooks = {
+        "_can_admit_decoder_waiting_request": ast.parse(
+            '''def _can_admit_decoder_waiting_request(self, request: Request) -> bool:
+    """Hook for decoder-local admission while traversing waiting requests."""
+    return True
+'''
+        ).body[0],
         "_can_admit_local_prefix": ast.parse(
             '''def _can_admit_local_prefix(self, request: Request, local_hits: int) -> bool:
     """Hook for decoder-local admission before connector lookup/allocation."""
@@ -664,7 +670,10 @@ def test_recompute_only_adds_decoder_admission_hooks():
             return self.generic_visit(node)
 
         def visit_If(self, node):
-            if ast.unparse(node.test) == ("not self._can_admit_local_prefix(request, num_new_local_computed_tokens)"):
+            if ast.unparse(node.test) in {
+                "not self._can_admit_decoder_waiting_request(request)",
+                "not self._can_admit_local_prefix(request, num_new_local_computed_tokens)",
+            }:
                 expected = ast.parse("skip_request(request_queue)\ncontinue").body
                 assert not node.orelse and canonical_ast(node.body) == canonical_ast(expected)
                 return None
@@ -845,15 +854,15 @@ def test_recompute_preemption_preserves_protocol_and_batch_order(runtime, combin
     if offload == "exception":
         hook.side_effect = RuntimeError("CPU offload failed")
     combined._recomputed_reqs = []
-    combined._step_decoder_rejections = []
+    combined.rejected_requests = []
     saved = combined._preempt_or_recompute(req, 1.0)
     assert saved == (offload == "saved")
     if saved:
         assert req.status == runtime.RequestStatus.PREEMPTED
-        assert not combined._step_decoder_rejections and not combined._recomputed_reqs
+        assert not combined.rejected_requests and not combined._recomputed_reqs
         return
     batch = Output(recomputed_reqs=combined._recomputed_reqs, num_scheduled_tokens={}, total_num_scheduled_tokens=0)
-    combined._record_decoder_cache_rejections(batch, combined._step_decoder_rejections)
+    combined._record_decoder_cache_rejections(batch, combined.rejected_requests)
     if marked:
         # The original in-flight batch must still be delivered before rejection.
         output = empty_model_output()
@@ -1187,7 +1196,7 @@ def test_restored_a_finishes_and_b_reuses_new_npu_blocks(runtime, combined, cach
     req.num_computed_tokens = 32
     combined.finished_recving_kv_req_ids = {"A"}
     combined.failed_recving_kv_req_ids = set()
-    combined._step_decoder_rejections = []
+    combined.rejected_requests = []
     combined._update_waiting_for_remote_kv(req)
     assert pool.get_cached_block(req.block_hashes[0], [0]) == [restored[0]]
     # Terminal decode output follows the real Scheduler completion path.

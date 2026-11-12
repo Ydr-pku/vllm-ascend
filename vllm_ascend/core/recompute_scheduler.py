@@ -102,6 +102,10 @@ class RecomputeScheduler(Scheduler):
 
     prefill_capacity_bound: bool
 
+    def _can_admit_decoder_waiting_request(self, request: Request) -> bool:
+        """Hook for decoder-local admission while traversing waiting requests."""
+        return True
+
     def _can_admit_local_prefix(self, request: Request, local_hits: int) -> bool:
         """Hook for decoder-local admission before connector lookup/allocation."""
         return True
@@ -534,6 +538,11 @@ class RecomputeScheduler(Scheduler):
                     continue
 
                 if not self._can_admit_waiting_request(request):
+                    skip_request(request_queue)
+                    continue
+
+                # delta for decoder_append_prefill: skip pending cache rejections independently of DyntraLB.
+                if not self._can_admit_decoder_waiting_request(request):
                     skip_request(request_queue)
                     continue
 
