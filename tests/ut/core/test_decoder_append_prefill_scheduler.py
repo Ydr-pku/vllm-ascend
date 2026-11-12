@@ -29,13 +29,13 @@ ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "vllm_ascend/core/decoder_append_prefill_scheduler.py"
 COPY_BASELINE_VLLM_REVISION = "24420b7a341af37a9bc3186e6fc6062512e0aa58"
 # Generated independently from Scheduler.schedule in the declared copy baseline.
-# The installed dependency can also be the supported v0.32.0 release, whose
+# The installed dependency can also be the supported v0.33.0 release, whose
 # upstream schedule legitimately differs from that main-branch snapshot.
 COPY_BASELINE_SCHEDULE_SHA256 = "4bf4b86f7d7a0244cd44ee57229243a75ef093b70756cb24d739256ebf0d2480"
 # Preserve the existing Ascend Recompute implementation independently of the
 # vLLM copy used by DecoderAppendPrefillScheduler.
-RECOMPUTE_BASELINE_ASCEND_REVISION = "01ccef0c6cf6048246b754cfcd6051fb7c8dc9cd"
-RECOMPUTE_BASELINE_MODULE_SHA256 = "3d7707282505a11690f4c07e184489307f1a83ca8ea33f7e76811cb98a9ed67f"
+RECOMPUTE_BASELINE_ASCEND_REVISION = "40354ac766a869832d62ef3baa78cb59e59f7f9f"
+RECOMPUTE_BASELINE_MODULE_SHA256 = "1b64ea51be78f4b659eea5259aa7a224593d17f29c413ef89a8764cab155a16d"
 VLLM = Path(os.environ.get("VLLM_SOURCE_ROOT", ROOT.parent / "vllm")) / "vllm"
 if not VLLM.is_dir():
     spec = importlib.util.find_spec("vllm")
@@ -141,12 +141,6 @@ def runtime(monkeypatch):
     namespace["create_request_queue"] = lambda policy: namespace["FCFSRequestQueue"]()
     execute_classes(VLLM / "v1/core/sched/scheduler.py", {"Scheduler"}, namespace)
     execute_classes(VLLM / "v1/core/sched/async_scheduler.py", {"AsyncScheduler"}, namespace)
-    # The supported release lane lacks the native encoder-update helper.
-    # Match its version gate without importing vLLM or requiring its wheel.
-    namespace["vllm_version_is"] = lambda version: version == "0.32.0" and not hasattr(
-        namespace["Scheduler"], "_get_encoder_input_updates"
-    )
-    execute_classes(SOURCE, {"DecoderAppendPrefillSchedulerCompat"}, namespace)
     execute_classes(
         SOURCE,
         {"DecoderCacheAdmissionMixin", "DecoderAppendPrefillScheduler", "AsyncDecoderAppendPrefillScheduler"},
@@ -593,35 +587,8 @@ def test_only_documented_admission_deltas_change_schedule():
             return self.generic_visit(node)
 
         def visit_Call(self, node):
-            if isinstance(node.func, ast.Name) and node.func.id == "SchedulerOutput":
-                assert all(k.arg not in {"skip_drafts", "encoder_input_updates"} for k in node.keywords)
-                index = next(i for i, k in enumerate(node.keywords) if k.arg == "new_block_ids_to_zero")
-                node.keywords.insert(
-                    index,
-                    ast.keyword(
-                        arg="encoder_input_updates",
-                        value=ast.parse(
-                            "self._get_encoder_input_updates("
-                            "num_scheduled_tokens, new_reqs_data, scheduled_encoder_inputs)",
-                            mode="eval",
-                        ).body,
-                    ),
-                )
-                index = next(i for i, k in enumerate(node.keywords) if k.arg == "ec_manager_metadata")
-                node.keywords.insert(
-                    index, ast.keyword(arg="skip_drafts", value=ast.parse("not drafts_needed", mode="eval").body)
-                )
-            if isinstance(node.func, ast.Attribute):
-                replacements = {
-                    "_get_computed_blocks": "self.kv_cache_manager.get_computed_blocks",
-                    "_aux_output_max_cache_hit": "self.aux_output_connector.max_cache_hit",
-                    "_aux_output_cap_external_hit": "self.aux_output_connector.cap_external_hit",
-                    "_aux_output_request_loading": "self.aux_output_connector.request_loading",
-                }
-                if node.func.attr == "_skip_reading_external_kv":
-                    return ast.parse("request.skip_reading_external_kv", mode="eval").body
-                if node.func.attr in replacements:
-                    node.func = ast.parse(replacements[node.func.attr], mode="eval").body
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "_skip_reading_external_kv":
+                return ast.parse("request.skip_reading_external_kv", mode="eval").body
             return self.generic_visit(node)
 
         def visit_Expr(self, node):
@@ -629,7 +596,7 @@ def test_only_documented_admission_deltas_change_schedule():
             if (
                 isinstance(call, ast.Call)
                 and isinstance(call.func, ast.Attribute)
-                and call.func.attr in {"_record_decoder_cache_rejections", "_set_optional_output_fields"}
+                and call.func.attr == "_record_decoder_cache_rejections"
             ):
                 return None
             return self.generic_visit(node)
@@ -1470,8 +1437,6 @@ def test_external_kv_skip_uses_the_installed_request_api(runtime, ordinary_sched
 @pytest.mark.parametrize("marked", [False, True])
 def test_auxiliary_cache_hit_bound_reaches_local_lookup(runtime, ordinary_scheduler, marked):
     scheduler = ordinary_scheduler
-    if not hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
-        pytest.skip("v0.32.0 has no auxiliary cache-hit limits")
     req = enqueue(runtime, scheduler, marked=marked, hits=16)
     scheduler.aux_output_connector = Mock(max_cache_hit=Mock(return_value=16))
     output = scheduler.schedule()
@@ -1481,8 +1446,6 @@ def test_auxiliary_cache_hit_bound_reaches_local_lookup(runtime, ordinary_schedu
 
 def test_resumable_request_refreshes_hash_lookahead(runtime, ordinary_scheduler):
     scheduler = ordinary_scheduler
-    if not hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
-        pytest.skip("v0.32.0 has no hash lookahead")
     req = enqueue(runtime, scheduler, hits=16)
     req.resumable = True
     req.block_hashes = ["discarded-streaming-token"]
@@ -1495,8 +1458,6 @@ def test_resumable_request_refreshes_hash_lookahead(runtime, ordinary_scheduler)
 
 def test_auxiliary_output_caps_external_hits(runtime, ordinary_scheduler):
     scheduler = ordinary_scheduler
-    if not hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
-        pytest.skip("v0.32.0 has no auxiliary cache-hit limits")
     req = enqueue(runtime, scheduler, marked=False)
     scheduler.connector = Mock(supports_divergent_local_hybrid_hits=False)
     scheduler.connector.get_num_new_matched_tokens.return_value = (16, False)
@@ -1512,8 +1473,6 @@ def test_auxiliary_output_caps_external_hits(runtime, ordinary_scheduler):
 
 def test_async_kv_load_waits_for_its_fence(runtime, ordinary_scheduler):
     scheduler = ordinary_scheduler
-    if not hasattr(runtime.Scheduler, "_drain_deferred_loads"):
-        pytest.skip("v0.32.0 has no deferred async loads")
     req = enqueue(runtime, scheduler, marked=False)
     scheduler.connector = Mock(supports_divergent_local_hybrid_hits=False)
     scheduler.connector.get_num_new_matched_tokens.return_value = (16, True)
@@ -1539,8 +1498,6 @@ def test_async_kv_load_waits_for_its_fence(runtime, ordinary_scheduler):
 
 def test_v2_encoder_payload_update_is_carried_to_worker(runtime, ordinary_scheduler):
     scheduler = ordinary_scheduler
-    if not hasattr(runtime.Scheduler, "_get_encoder_input_updates"):
-        pytest.skip("v0.32.0 has no encoder input updates")
     req = enqueue(runtime, scheduler, marked=False, hits=16)
     req.has_encoder_inputs = True
     req.mm_features = [
@@ -1554,22 +1511,7 @@ def test_v2_encoder_payload_update_is_carried_to_worker(runtime, ordinary_schedu
     assert req.mm_features[0].data == {"pixel_values": "cpu-payload"}
 
 
-def test_legacy_auxiliary_connector_keeps_external_load(runtime, scheduler):
-    req = enqueue(runtime, scheduler, marked=False)
-    scheduler.connector = Mock(supports_divergent_local_hybrid_hits=False)
-    scheduler.connector.get_num_new_matched_tokens.return_value = (16, True)
-    scheduler.aux_output_connector = SimpleNamespace(build_connector_meta=Mock(return_value=None))
-    output = scheduler.schedule()
-    assert not output.num_scheduled_tokens
-    assert req.num_computed_tokens == 16
-    scheduler.connector.update_state_after_alloc.assert_called_once()
-
-
-@pytest.mark.parametrize("vllm_version", ["main", "0.32.0"])
-def test_priority_self_preemption_follows_version_policy(runtime, scheduler, monkeypatch, vllm_version):
-    monkeypatch.setitem(
-        runtime.RecomputeScheduler.schedule.__globals__, "vllm_version_is", lambda version: version == vllm_version
-    )
+def test_priority_self_preemption_continues_with_higher_priority_request(runtime, scheduler):
     first = enqueue(runtime, scheduler, "first", marked=False)
     second = enqueue(runtime, scheduler, "second", marked=False)
     scheduler.waiting = runtime.FCFSRequestQueue()
@@ -1593,8 +1535,7 @@ def test_priority_self_preemption_follows_version_policy(runtime, scheduler, mon
     else:
         scheduler._preempt_request = Mock(side_effect=preempt)
     output = scheduler.schedule()
-    release_recompute = vllm_version == "0.32.0" and isinstance(scheduler, runtime.RecomputeScheduler)
-    assert output.num_scheduled_tokens == ({} if release_recompute else {"second": 1})
+    assert output.num_scheduled_tokens == {"second": 1}
     assert first not in scheduler.running
     assert second in scheduler.running
 
@@ -1631,7 +1572,6 @@ def test_output_fields_follow_the_installed_worker_contract(runtime, scheduler):
         assert output.num_common_prefix_blocks == [0]
         scheduler.kv_cache_manager.get_num_common_prefix_blocks.assert_called_once_with(req.request_id)
     else:
-        if hasattr(runtime.Scheduler, "_get_encoder_input_updates"):
-            assert output.encoder_input_updates == {}
+        assert output.encoder_input_updates == {}
         assert output.num_common_prefix_blocks == []
         scheduler.kv_cache_manager.get_num_common_prefix_blocks.assert_not_called()

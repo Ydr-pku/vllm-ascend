@@ -8,6 +8,8 @@ The feature is opt-in in the Decoder configuration and at the proxy. It is inten
 
 ## Requirements
 
+The supported vLLM baselines are v0.33.0 and the verified main revision `24420b7a341af37a9bc3186e6fc6062512e0aa58`. v0.32.0 is no longer supported.
+
 - A working vLLM V1 P/D-disaggregated deployment, with Decode services configured as `kv_role="kv_consumer"` and prefix caching enabled.
 - `scheduler_config.decoder_append_prefill_enable=true` in every Decoder's `--additional-config`. The platform selects the append-prefill admission Scheduler for its synchronous or asynchronous scheduling mode.
 - The standalone `examples/disaggregated_prefill_v1/decoder_append_prefill_proxy_server.py` proxy, started with `--enable-decoder-append-prefill`.
