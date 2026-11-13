@@ -539,7 +539,7 @@ class RecomputeScheduler(Scheduler):
                     skip_request(request_queue)
                     continue
 
-                # delta for decoder_append_prefill: skip pending cache rejections independently of DyntraLB.
+                # delta for decoder_append_prefill: skip requests pending cache-miss rejection.
                 if not self._can_admit_decoder_waiting_request(request):
                     skip_request(request_queue)
                     continue
