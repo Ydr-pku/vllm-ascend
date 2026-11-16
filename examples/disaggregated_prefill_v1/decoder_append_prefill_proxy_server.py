@@ -1139,10 +1139,13 @@ async def handle_completions_impl(api: str, request: Request):
                     },
                 )
 
+        response_status_code = 200
+
         async def generate_stream():
             nonlocal instance_info
             nonlocal request_released, released_kv
             nonlocal preopened_gen, preopened_first
+            nonlocal response_status_code
             generated_token = ""
             gen = None
             retry_count = 0
@@ -1380,6 +1383,7 @@ async def handle_completions_impl(api: str, request: Request):
                 raise
             # delta for decoder_append_prefill: surface failures and finalize resources and session state.
             except BackendContractError as exc:
+                response_status_code = 502
                 logger.error("Request %s failed routing gate: %s", instance_info.request_id, exc)
                 yield encode_response_chunk(
                     {
@@ -1395,6 +1399,7 @@ async def handle_completions_impl(api: str, request: Request):
                     stream_flag,
                 )
             except Exception as exc:
+                response_status_code = 502
                 logger.error(
                     "Error during streaming from decoder %s:%s: %s while handling request %s; releasing prefiller KV",
                     instance_info.decoder_host,
@@ -1431,13 +1436,28 @@ async def handle_completions_impl(api: str, request: Request):
                         )
 
         media_type = "text/event-stream; charset=utf-8" if stream_flag else "application/json"
+        response_headers = routing_response_headers(instance_info)
+        response_gen = generate_stream()
+        response_content = response_gen
+        if not stream_flag:
+            # Resolve admission fallback before committing a non-streaming HTTP
+            # status. Leave the generator paused at its response so ownership
+            # and the session busy guard remain live until delivery or cleanup.
+            try:
+                first_response_chunk = await response_gen.__anext__()
+            except StopAsyncIteration:
+                first_response_chunk = b""
+            response_content = _replay_first_chunk(first_response_chunk, response_gen)
 
         # delta for decoder_append_prefill: retain cleanup ownership until response delivery or finalization.
         async def finalize_response_once():
             nonlocal request_released, released_kv
             try:
-                if preopened_gen is not None:
-                    await preopened_gen.aclose()
+                try:
+                    await response_gen.aclose()
+                finally:
+                    if preopened_gen is not None:
+                        await preopened_gen.aclose()
             finally:
                 try:
                     if not request_released:
@@ -1448,10 +1468,11 @@ async def handle_completions_impl(api: str, request: Request):
                     await finish_session_once(False)
 
         return CleanupStreamingResponse(
-            generate_stream(),
+            response_content,
             finalize=finalize_response_once,
+            status_code=response_status_code,
             media_type=media_type,
-            headers=routing_response_headers(instance_info),
+            headers=response_headers,
         )
     # delta for decoder_append_prefill: close pre-opened streams and release sessions on cancellation before delivery.
     except asyncio.CancelledError:

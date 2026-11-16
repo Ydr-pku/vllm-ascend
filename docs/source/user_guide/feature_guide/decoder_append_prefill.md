@@ -125,6 +125,8 @@ Use `proxy_metrics.initial_route`, `final_route` and `admission_fallback` to dis
 
 On an initial Decoder-local cache miss, the Scheduler rejects the request before prefill or output. The proxy retries through normal P/D with the complete conversation history and original generation budget.
 
+If that fallback fails, a non-streaming request returns HTTP 502 with an error body. Streaming requests report the error in the response stream because their HTTP headers may already have been sent.
+
 ## Optional Recompute and KV offload
 
 Append-prefill works with synchronous or asynchronous scheduling and does not require Recompute or CPU offload. When combined with Recompute and `PreemptOffloadConnector`, it reuses the existing preemption and KV offload mechanisms. The connector saves a preempted request's KV to CPU and reloads it when that same request resumes.

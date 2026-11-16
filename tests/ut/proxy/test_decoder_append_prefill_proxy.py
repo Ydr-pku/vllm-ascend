@@ -927,7 +927,7 @@ async def test_failed_fallback_never_sends_unprefilled_request_to_d(monkeypatch,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("failure", ["no_prefiller", "http_503"])
+@pytest.mark.parametrize("failure", ["no_prefiller", "http_503", "missing_transfer", "decode_503"])
 async def test_admission_fallback_failure_returns_error_and_releases_once(monkeypatch, stream, failure):
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
@@ -938,7 +938,18 @@ async def test_admission_fallback_failure_returns_error_and_releases_once(monkey
     def backend(request):
         seen.append(request.url.port)
         if request.url.port == 8100:
-            return httpx.Response(503, json={"error": "injected P unavailable"})
+            if failure == "http_503":
+                return httpx.Response(503, json={"error": "injected P unavailable"})
+            return httpx.Response(
+                200,
+                json=(
+                    {}
+                    if failure == "missing_transfer"
+                    else {"kv_transfer_params": {"remote_engine_id": "fresh", "remote_block_ids": [1]}}
+                ),
+            )
+        if failure == "decode_503" and len(seen) == 3:
+            return httpx.Response(503, json={"error": "injected fallback D unavailable"})
         miss = {
             "choices": [{"text": "", "token_ids": [], "finish_reason": "stop", "stop_reason": "decoder_cache_miss"}]
         }
@@ -956,23 +967,120 @@ async def test_admission_fallback_failure_returns_error_and_releases_once(monkey
     if failure == "no_prefiller":
         scheduler.remove_instances(proxy.ServerRole.PREFILL, [("127.0.0.1", 8100)])
     try:
-        response = await proxy.handle_completions_impl(
-            "/completions",
-            FakeRequest(
-                {"X-Session-ID": "session-1"},
-                {"prompt": [7, 9, 11], "max_tokens": 16, "stream": stream},
-            ),
-        )
-        raw = b"".join([chunk async for chunk in response.body_iterator]).decode()
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=proxy.app), base_url="http://proxy") as client:
+            response = await client.post(
+                "/v1/completions",
+                headers={"X-Session-ID": "session-1"},
+                json={"prompt": [7, 9, 11], "max_tokens": 16, "stream": stream},
+            )
+        raw = response.text
+        assert response.status_code == (200 if stream else 502)
         events = (
             [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
             if stream
             else [json.loads(raw)]
         )
-        assert events[0]["error"]["code"] == "decoder_cache_miss_fallback_failed"
-        assert seen == ([8200] if failure == "no_prefiller" else [8200, 8100])
+        if failure == "decode_503":
+            assert events[0]["error"]["type"] == "proxy_stream_error"
+        else:
+            assert events[0]["error"]["code"] == (
+                "missing_prefiller_kv_transfer"
+                if failure == "missing_transfer"
+                else "decoder_cache_miss_fallback_failed"
+            )
+        assert seen == (
+            [8200] if failure == "no_prefiller" else [8200, 8100, 8200] if failure == "decode_503" else [8200, 8100]
+        )
         assert scheduler.request_num == 0
         assert scheduler.healthcheck()["in_flight_sessions"] == 0
+        assert all(server.active_tokens == 0 for server in scheduler.decoders.values())
+        assert all(server.active_kv_cache == 0 for server in scheduler.prefillers.values())
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_waits_for_nonstream_fallback_cleanup(monkeypatch):
+    scheduler = make_dp4_scheduler()
+    bind_and_finish_first_turn(scheduler)
+    runtime, _ = install_mock_backends(monkeypatch, scheduler)
+    entered = asyncio.Event()
+    disconnect = asyncio.Event()
+    closed = []
+    finished = []
+    schedule = runtime.schedule
+
+    async def record_finish(method, *args, **kwargs):
+        if method in {"finish_request", "finish_session"}:
+            finished.append(method)
+        return await schedule(method, *args, **kwargs)
+
+    class Request(FakeRequest):
+        async def receive(self):
+            await disconnect.wait()
+            return {"type": "http.disconnect"}
+
+    async def decode(*args, **kwargs):
+        yield b'{"choices":[{"text":"","stop_reason":"decoder_cache_miss"}]}'
+
+    async def prefill(*args, **kwargs):
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+        finally:
+            closed.append("prefill")
+
+    monkeypatch.setattr(runtime, "schedule", record_finish)
+    monkeypatch.setattr(proxy, "stream_service_response", decode)
+    monkeypatch.setattr(proxy, "send_request_to_service", prefill)
+    request = Request({"X-Session-ID": "session-1"}, {"prompt": [7, 9], "stream": False})
+    wrapped = proxy.with_cancellation(lambda request: proxy.handle_completions_impl("/completions", request))
+    task = asyncio.create_task(wrapped(request=request))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert scheduler.request_num == 1
+        assert scheduler.healthcheck()["in_flight_sessions"] == 1
+        disconnect.set()
+        await asyncio.wait_for(task, 1)
+        assert closed == ["prefill"]
+        assert finished.count("finish_request") == 1
+        assert finished.count("finish_session") == 1
+        assert scheduler.request_num == 0
+        assert scheduler.healthcheck()["in_flight_sessions"] == 0
+        assert all(server.active_tokens == 0 for server in scheduler.decoders.values())
+        assert all(server.active_kv_cache == 0 for server in scheduler.prefillers.values())
+        assert scheduler.session_affinities["session-1"].turn_count == 1
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_unconsumed_nonstream_response_finalizes_once(monkeypatch):
+    scheduler = make_dp4_scheduler()
+    runtime, _ = install_mock_backends(monkeypatch, scheduler)
+    finished = []
+    schedule = runtime.schedule
+
+    async def record_finish(method, *args, **kwargs):
+        if method in {"finish_request", "finish_session"}:
+            finished.append(method)
+        return await schedule(method, *args, **kwargs)
+
+    monkeypatch.setattr(runtime, "schedule", record_finish)
+    try:
+        response = await proxy.handle_completions_impl("/completions", FakeRequest({"X-Session-ID": "undelivered"}))
+        assert response.status_code == 200
+        assert scheduler.request_num == 1
+        assert scheduler.healthcheck()["in_flight_sessions"] == 1
+        await response.finalize()
+        await response.finalize()
+        assert finished.count("finish_request") == 1
+        assert finished.count("finish_session") == 1
+        assert scheduler.request_num == 0
+        assert not scheduler.session_affinities
         assert all(server.active_tokens == 0 for server in scheduler.decoders.values())
         assert all(server.active_kv_cache == 0 for server in scheduler.prefillers.values())
     finally:
