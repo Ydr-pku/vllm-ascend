@@ -90,6 +90,7 @@ parse_server_addresses = base_proxy.parse_server_addresses
 logger = logging.getLogger(__name__)
 
 
+# delta for decoder_append_prefill: frame complete SSE events for admission and stream-completion handling.
 class SSEFramer:
     """Reassemble OpenAI JSON SSE events independently of HTTP chunk boundaries."""
 
@@ -138,6 +139,7 @@ class SSEFramer:
             raise ValueError("Truncated SSE stream or missing DONE")
 
 
+# delta for decoder_append_prefill: add route/session types and owner Decoder/DP-rank metadata.
 class RouteMode(str, Enum):
     PD = "pd"
     DECODER_LOCAL = "decoder_local"
@@ -209,6 +211,7 @@ def setup_logging(log_level: str) -> None:
     logger.setLevel(getattr(logging, log_level.upper()))
 
 
+# delta for decoder_append_prefill: manage owner/rank, session TTL, and in-flight turns on the base P/D scheduler.
 class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
     """Add session ownership to the shared P/D proxy's load scheduler."""
 
@@ -454,6 +457,7 @@ class NodeListener:
             return False
 
 
+# delta for decoder_append_prefill: add routing, session lifetime, and Decoder owner/rank configuration.
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
@@ -615,6 +619,7 @@ def create_app():
     return app
 
 
+# delta for decoder_append_prefill: await cancelled tasks and finalize undelivered responses.
 def with_cancellation(handler_func):
     @functools.wraps(handler_func)
     async def wrapper(*args, **kwargs):
@@ -653,6 +658,7 @@ def with_cancellation(handler_func):
     return wrapper
 
 
+# delta for decoder_append_prefill: pin backend DP rank and expose route/owner metadata in response headers.
 def decoder_headers(request_id: str, decoder_dp_rank: int) -> dict[str, str]:
     """Create trusted backend headers; no incoming client rank/header is forwarded."""
     return {**auth_headers(request_id), DP_RANK_HEADER: str(decoder_dp_rank)}
@@ -669,6 +675,7 @@ def routing_response_headers(info: InstanceInfo) -> dict[str, str]:
     }
 
 
+# delta for decoder_append_prefill: sanitize metadata, reserve the session, and select P/D or owner Decoder.
 async def plan_request_route(request: Request, req_data: dict) -> RoutePlan:
     """Reserve session affinity and choose PD or Decoder-local routing."""
     args = get_global_args()
@@ -709,6 +716,7 @@ async def plan_request_route(request: Request, req_data: dict) -> RoutePlan:
     )
 
 
+# delta for decoder_append_prefill: pin DP rank, inspect complete responses, and propagate partial-stream failures.
 async def stream_service_response(
     client: httpx.AsyncClient,
     endpoint: str,
@@ -780,6 +788,7 @@ async def _finish_instance(runtime: WorkerRuntime, info: InstanceInfo, *, releas
     )
 
 
+# delta for decoder_append_prefill: reuse the pinned Decoder on P/D fallback or rebind an unavailable owner.
 async def _reserve_pd_decoder(
     runtime: WorkerRuntime,
     decoder_score: float,
@@ -800,6 +809,7 @@ async def _reserve_pd_decoder(
         return await runtime.schedule("pick_decoder", decoder_score), "decoder_unavailable_rebind"
 
 
+# delta for decoder_append_prefill: adapt P/D assignment for owner affinity, fresh transfer metadata, and cancellation.
 async def assign_pd(
     api: str,
     req_data: Any,
@@ -876,6 +886,7 @@ async def assign_pd(
         raise
 
 
+# delta for decoder_append_prefill: bypass P and require a cache hit on the owner Decoder/rank.
 async def assign_decoder_local(
     req_data: dict,
     request_length: int,
@@ -905,6 +916,7 @@ async def assign_decoder_local(
     )
 
 
+# delta for decoder_append_prefill: dispatch P/D or D-local, rebinding unavailable owners through P/D.
 async def assign_request(api: str, req_data: dict, request_length: int, route: RoutePlan) -> InstanceInfo:
     if route.mode is RouteMode.DECODER_LOCAL:
         try:
@@ -931,6 +943,7 @@ async def assign_request(api: str, req_data: dict, request_length: int, route: R
     )
 
 
+# delta for decoder_append_prefill: reassign either route without double release while retaining session owner/rank.
 async def reassign_instances(
     api: str,
     req_data: Any,
@@ -976,6 +989,7 @@ async def _replay_first_chunk(first_chunk: bytes, gen: Any):
         await gen.aclose()
 
 
+# delta for decoder_append_prefill: finalize resources and sessions even if the response body never starts.
 class CleanupStreamingResponse(StreamingResponse):
     """Retain cleanup ownership even when the body iterator never starts."""
 
@@ -996,6 +1010,7 @@ class CleanupStreamingResponse(StreamingResponse):
                     await self.finalize()
 
 
+# delta for decoder_append_prefill: validate session requests, bind owners, and finalize each turn.
 async def handle_completions_impl(api: str, request: Request):
     runtime = get_runtime()
     args = get_global_args()
@@ -1004,7 +1019,6 @@ async def handle_completions_impl(api: str, request: Request):
     released_kv = False
     try:
         req_data = await request.json()
-        # delta for decoder append prefill: reject echo before session reservation or backend dispatch.
         if args.enable_decoder_append_prefill and req_data.get("echo", False):
             return JSONResponse(
                 status_code=400,
@@ -1136,6 +1150,8 @@ async def handle_completions_impl(api: str, request: Request):
             completion_tokens = 0
             reported_prefiller_cached_tokens = instance_info.prefiller_cached_tokens
             stream_succeeded = False
+            local_admission_pending = stream_flag and instance_info.route_mode is RouteMode.DECODER_LOCAL
+            pending_admission_chunks: list[bytes] = []
 
             async def release_prefill_kv_once() -> None:
                 nonlocal released_kv
@@ -1184,12 +1200,17 @@ async def handle_completions_impl(api: str, request: Request):
                             chunk_json = json.loads(chunk_str)
                         except json.JSONDecodeError:
                             logger.debug("Skipping chunk: %s", chunk_str)
+                            for pending_chunk in pending_admission_chunks:
+                                yield pending_chunk
+                            pending_admission_chunks.clear()
+                            local_admission_pending = False
                             yield chunk
                             continue
                         # HTTP headers describe the initial route and cannot be
                         # changed after streaming starts. The final JSON (or
                         # parsed SSE chunks) records any recompute recovery so
                         # clients can distinguish P fallback from D-local reuse.
+                        # delta for decoder_append_prefill: report route, owner/rank, and fallback outcomes.
                         chunk_json["proxy_metrics"] = {
                             "initial_route": initial_route,
                             "final_route": instance_info.route_mode.value,
@@ -1214,7 +1235,10 @@ async def handle_completions_impl(api: str, request: Request):
                             if update_cached_tokens_in_chunk(chunk_json, reported_prefiller_cached_tokens):
                                 chunk = encode_response_chunk(chunk_json, is_sse)
                             if not choices:
-                                yield chunk
+                                if local_admission_pending:
+                                    pending_admission_chunks.append(chunk)
+                                else:
+                                    yield chunk
                                 continue
 
                         choice = choices[0]
@@ -1224,6 +1248,7 @@ async def handle_completions_impl(api: str, request: Request):
                         generated_token += content
 
                         stop_reason = choice.get("stop_reason")
+                        # delta for decoder_append_prefill: retry local misses via P/D; fail on KV loss after output.
                         if stop_reason == "decoder_cache_lost_after_output":
                             raise BackendContractError(
                                 "Decoder lost KV after output; replay would duplicate tokens",
@@ -1238,6 +1263,8 @@ async def handle_completions_impl(api: str, request: Request):
                             # This is an admission fallback, not recovery after
                             # Decoder prefill. Preserve the entire original
                             # prompt/history and generation budget.
+                            pending_admission_chunks.clear()
+                            local_admission_pending = False
                             await gen.aclose()
                             req_data.get("vllm_xargs", {}).pop("require_decoder_cache_hit", None)
                             generated_token = ""
@@ -1289,6 +1316,7 @@ async def handle_completions_impl(api: str, request: Request):
                             else:
                                 req_data["prompt"] = origin_prompt + generated_token
                             req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
+                            # delta for decoder_append_prefill: adapt legacy replay admission and session binding.
                             (req_data.get("vllm_xargs") or {}).pop("require_decoder_cache_hit", None)
                             tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
                             instance_info = await reassign_instances(api, req_data, tmp_request_length, instance_info)
@@ -1318,6 +1346,28 @@ async def handle_completions_impl(api: str, request: Request):
                             else:
                                 choice["text"] = generated_token
                             chunk = encode_response_chunk(chunk_json, is_sse)
+                        # delta for decoder_append_prefill: release buffered metadata after local admission succeeds.
+                        if local_admission_pending:
+                            # Chat serving sends its role/prompt metadata before
+                            # the zero-output admission result. Keep those frames
+                            # private until the local attempt actually proceeds.
+                            has_output = any(
+                                candidate.get("token_ids")
+                                or candidate.get("text")
+                                or candidate.get("logprobs")
+                                or any(
+                                    value for name, value in (candidate.get("delta") or {}).items() if name != "role"
+                                )
+                                for candidate in choices
+                            )
+                            finished = any(candidate.get("finish_reason") is not None for candidate in choices)
+                            if not has_output and not finished:
+                                pending_admission_chunks.append(chunk)
+                                continue
+                            local_admission_pending = False
+                            for pending_chunk in pending_admission_chunks:
+                                yield pending_chunk
+                            pending_admission_chunks.clear()
                         yield chunk
                 stream_succeeded = True
             except asyncio.CancelledError:
@@ -1328,6 +1378,7 @@ async def handle_completions_impl(api: str, request: Request):
                     instance_info.request_id,
                 )
                 raise
+            # delta for decoder_append_prefill: surface failures and finalize resources and session state.
             except BackendContractError as exc:
                 logger.error("Request %s failed routing gate: %s", instance_info.request_id, exc)
                 yield encode_response_chunk(
@@ -1381,6 +1432,7 @@ async def handle_completions_impl(api: str, request: Request):
 
         media_type = "text/event-stream; charset=utf-8" if stream_flag else "application/json"
 
+        # delta for decoder_append_prefill: retain cleanup ownership until response delivery or finalization.
         async def finalize_response_once():
             nonlocal request_released, released_kv
             try:
@@ -1401,6 +1453,7 @@ async def handle_completions_impl(api: str, request: Request):
             media_type=media_type,
             headers=routing_response_headers(instance_info),
         )
+    # delta for decoder_append_prefill: close pre-opened streams and release sessions on cancellation before delivery.
     except asyncio.CancelledError:
         with anyio.CancelScope(shield=True):
             try:
@@ -1551,6 +1604,7 @@ async def reset_prefix_cache(request: Request):
         except Exception as e:
             logger.error("reset_prefix_cache failed for %s: %s", base_url, e)
             failures.append(base_url)
+    # delta for decoder_append_prefill: invalidate session owners after backend prefix-cache reset.
     runtime.scheduler.invalidate_all_sessions()
     if failures:
         return JSONResponse(status_code=500, content={"failed": failures})

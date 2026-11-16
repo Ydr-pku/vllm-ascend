@@ -608,6 +608,88 @@ class Frames(httpx.AsyncByteStream):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("local_result", ["miss", "hit", "empty_hit"])
+async def test_local_chat_admission_keeps_only_the_accepted_stream_metadata(monkeypatch, local_result):
+    scheduler = make_dp4_scheduler()
+    bind_and_finish_first_turn(scheduler)
+    runtime, _ = install_mock_backends(monkeypatch, scheduler)
+    seen = []
+
+    def backend(request):
+        body = json.loads(request.content)
+        seen.append(request.url.port)
+        if request.url.port == 8100:
+            return httpx.Response(
+                200, json={"kv_transfer_params": {"remote_engine_id": "fresh", "remote_block_ids": [1]}}
+            )
+        local = body.get("vllm_xargs", {}).get("require_decoder_cache_hit") == 1
+        miss = local and local_result == "miss"
+        response_id = "local-attempt" if local else "fallback-success"
+        frames = [
+            {
+                "id": response_id,
+                "prompt_token_ids": [7, 9],
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 0, "total_tokens": 2},
+            }
+        ]
+        if not miss and local_result != "empty_hit":
+            frames.append(
+                {"id": response_id, "choices": [{"index": 0, "delta": {"content": "answer"}, "token_ids": [25]}]}
+            )
+        frames.append(
+            {
+                "id": response_id,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                        "stop_reason": "decoder_cache_miss" if miss else None,
+                    }
+                ],
+            }
+        )
+        return httpx.Response(200, stream=Frames(frames))
+
+    for role, instances in [
+        (proxy.ServerRole.PREFILL, scheduler.prefillers),
+        (proxy.ServerRole.DECODE, scheduler.decoders),
+    ]:
+        for key, server in instances.items():
+            await runtime._clients[role][key].aclose()
+            runtime._clients[role][key] = httpx.AsyncClient(
+                base_url=proxy.build_base_url(server.host, server.port), transport=httpx.MockTransport(backend)
+            )
+    try:
+        response = await proxy.handle_completions_impl(
+            "/chat/completions",
+            FakeRequest(
+                {"X-Session-ID": "session-1"},
+                {"messages": [{"role": "user", "content": "followup"}], "stream": True, "return_token_ids": True},
+            ),
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        frames = [json.loads(chunk[6:]) for chunk in chunks if chunk != b"data: [DONE]\n\n"]
+        expected_id = "fallback-success" if local_result == "miss" else "local-attempt"
+        assert {frame["id"] for frame in frames} == {expected_id}
+        assert sum(choice["delta"].get("role") == "assistant" for frame in frames for choice in frame["choices"]) == 1
+        assert "".join(choice["delta"].get("content", "") for frame in frames for choice in frame["choices"]) == (
+            "" if local_result == "empty_hit" else "answer"
+        )
+        assert frames[0]["prompt_token_ids"] == [7, 9]
+        assert frames[0]["usage"]["prompt_tokens"] == 2
+        assert sum(chunk == b"data: [DONE]\n\n" for chunk in chunks) == 1
+        assert seen == ([8200, 8100, 8200] if local_result == "miss" else [8200])
+        assert scheduler.request_num == 0
+        assert scheduler.healthcheck()["in_flight_sessions"] == 0
+        assert all(server.active_tokens == 0 for server in scheduler.decoders.values())
+        assert all(server.active_kv_cache == 0 for server in scheduler.prefillers.values())
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize("echo", [None, False], ids=["echo-omitted", "echo-false"])
 @pytest.mark.parametrize(

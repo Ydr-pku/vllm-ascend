@@ -135,6 +135,8 @@ The combined append-prefill/Recompute Scheduler coordinates KV recovery with the
 - **Admitting a new follow-up turn:** A later request in the same session still needs a usable prefix on its owner Decoder. A CPU copy alone does not satisfy this requirement. Once restored KV is resident on the Decoder, later turns can reuse it through normal prefix caching.
 - **Handling failed recovery:** The request follows the feature's fallback or termination handling. Failed recovery does not silently turn a Decoder-local request into a full prefill on the Decoder.
 
+Same-request KV restoration is separate from the proxy's legacy `stop_reason="recomputed"` text replay. That replay can be reached by ordinary P/D requests, including cold sessions and admission fallbacks, when KV cannot be restored. It is not adapted for multi-role chat: it can change the supplied history, does not preserve the original generation budget, and reports only the final decode leg's usage. Do not rely on this path for transparent chat continuation. A Decoder-local request that has already produced output instead terminates with `decoder_cache_lost_after_output` when its KV recovery fails.
+
 To enable the combined Scheduler, configure both options in the Decode service's `--additional-config`:
 
 ```bash
