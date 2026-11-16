@@ -8,6 +8,7 @@ from vllm.v1.worker.gpu import model_runner as upstream
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp as _dispatch_cg_and_sync_dp
 
 from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
+from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.utils import copy_kv_cache_blocks_inplace
 
 
@@ -90,8 +91,8 @@ def initialize_kv_cache(
         )
     additional_attn_cg_support = self.model_state.get_additional_cg_support()
     attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
-    # The speculator clears the flag at load time when the checkpoint has
-    # no confidence head, so it holds the effective value.
+    # Read the effective value from the loaded speculator. Without a confidence
+    # head, upstream can provide confidence through its online estimator.
     self.adaptive_verification = upstream.maybe_create_adaptive_verification_manager(
         enable_adaptive_verification=getattr(self.speculator, "enable_adaptive_verification", False),
         attn_groups=self.attn_groups,
@@ -214,7 +215,20 @@ def initialize_kv_cache(
         # vLLM main carries routed-experts output through the AuxOutput
         # connector, which the V2 NPUModelRunner relies on via super().
         if self.vllm_config.aux_output_config.enabled:
-            self.aux_output_connector = upstream.get_aux_output_connector(self.model, self.vllm_config, kv_cache_config)
+            if vllm_version_is("0.33.0"):
+                self.aux_output_connector = upstream.get_aux_output_connector(  # type: ignore[call-arg]
+                    self.model, self.vllm_config, kv_cache_config
+                )
+            else:
+                # Main drops the constructor argument and initializes the data
+                # plane once the KV-cache layout is resolved.
+                if self.aux_output_connector is None:
+                    self.aux_output_connector = upstream.get_aux_output_connector(  # type: ignore[call-arg]
+                        self.model, self.vllm_config
+                    )
+                self.aux_output_connector.initialize_output_storage(  # type: ignore[attr-defined]
+                    kv_cache_config
+                )
 
 
 upstream.copy_kv_cache_blocks_inplace = copy_kv_cache_blocks_inplace

@@ -955,7 +955,6 @@ def make_platform_config(
             for key in (
                 "dyntra_lb_config",
                 "short_request_first_config",
-                "profiling_chunk_config",
                 "batch_job_sched_config",
             )
         },
@@ -987,7 +986,6 @@ def test_platform_combines_explicit_append_scheduler_and_rejects_overriding_poli
     for key, reason in (
         ("dyntra_lb_config", "decode-only"),
         ("short_request_first_config", "PD-disaggregated Decoders"),
-        ("profiling_chunk_config", "PP>1"),
         ("batch_job_sched_config", "long-input, short-output agentic"),
     ):
         getattr(policies, key).enabled = True
@@ -1396,7 +1394,6 @@ def test_append_prefill_config_rejects_non_decoder_nodes(platform_runtime, role,
         ("enable_balance_scheduling", "PD-mixed"),
         ("dyntra_lb_config", "decode-only"),
         ("short_request_first_config", "PD-disaggregated Decoders"),
-        ("profiling_chunk_config", "PP>1"),
         ("batch_job_sched_config", "long-input, short-output agentic"),
     ],
 )

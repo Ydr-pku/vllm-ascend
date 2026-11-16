@@ -705,6 +705,7 @@ async def test_local_chat_admission_keeps_only_the_accepted_stream_metadata(monk
     ],
 )
 async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stream, echo, chat, token_budget):
+    """A local miss must retry P/D with the original conversation and token limits."""
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
     runtime, _ = install_mock_backends(monkeypatch, scheduler)

@@ -156,6 +156,6 @@ To enable CPU KV storage and reload, follow [Preempt Offload Connector](preempt_
 
 ## Support and validation boundaries
 
-- DyntraLB is unsupported because it requires decode-only Decoder work. Balance, ShortRequestFirst, profiling-chunk and batch-job policies are also not composed with the append-prefill Scheduler. ShortRequestFirst can still be configured independently on Prefill nodes.
-- The current target Decode configuration uses pipeline parallel size `1`. Combinations with profiling-based chunks or larger pipeline parallel sizes need separate admission and pipeline validation.
+- DyntraLB is unsupported because it requires decode-only Decoder work. Balance, ShortRequestFirst and batch-job policies are also not composed with the append-prefill Scheduler. ShortRequestFirst can still be configured independently on Prefill nodes.
+- The current target Decode configuration uses pipeline parallel size `1`. Larger pipeline parallel sizes need separate admission and pipeline validation.
 - Restart the proxy after Decoder restarts to clear session affinity. Use one proxy worker.
