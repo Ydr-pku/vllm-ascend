@@ -570,13 +570,13 @@ async def test_decoder_local_recompute_signal_fails_without_prefiller_retry(monk
     def backend(request):
         seen.append(request.url.port)
         content = "partial" if has_output else ""
-        choice = {"message": {"content": content}} if chat else {"text": content}
+        choice: dict[str, Any] = {"message": {"content": content}} if chat else {"text": content}
         result = {"choices": [{**choice, "stop_reason": "recomputed"}]}
         if not stream:
             return httpx.Response(200, json=result)
-        frames = []
+        frames: list[dict[str, Any]] = []
         if has_output:
-            prior = {"delta": {"content": content}} if chat else {"text": content}
+            prior: dict[str, Any] = {"delta": {"content": content}} if chat else {"text": content}
             frames.append({"choices": [prior]})
         frames.append({"choices": [{"stop_reason": "recomputed"}]})
         response_stream = Frames(frames)
