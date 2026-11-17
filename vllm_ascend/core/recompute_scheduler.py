@@ -102,9 +102,9 @@ class RecomputeScheduler(Scheduler):
 
     prefill_capacity_bound: bool
 
-    def _can_admit_decoder_waiting_request(self, request: Request) -> bool:
-        """Hook for decoder-local admission while traversing waiting requests."""
-        return True
+    def _is_pending_decoder_cache_rejection(self, request: Request) -> bool:
+        """Hook for requests awaiting decoder-local cache-rejection output."""
+        return False
 
     def _can_admit_local_prefix(self, request: Request, local_hits: int) -> bool:
         """Hook for decoder-local admission before connector lookup/allocation."""
@@ -540,7 +540,7 @@ class RecomputeScheduler(Scheduler):
                     continue
 
                 # delta for decoder_append_prefill: skip requests pending cache-miss rejection.
-                if not self._can_admit_decoder_waiting_request(request):
+                if self._is_pending_decoder_cache_rejection(request):
                     skip_request(request_queue)
                     continue
 

@@ -1252,6 +1252,14 @@ async def handle_completions_impl(api: str, request: Request):
 
                         stop_reason = choice.get("stop_reason")
                         # delta for decoder_append_prefill: retry local misses via P/D; fail on KV loss after output.
+                        if stop_reason == "recomputed" and instance_info.route_mode is RouteMode.DECODER_LOCAL:
+                            # Local append supports CPU KV offload/restore only.
+                            # Older backends may still signal return-to-P on
+                            # offload failure; never replay that local request.
+                            raise BackendContractError(
+                                "Decoder-local KV offload failed; Prefiller recomputation is unsupported",
+                                "decoder_offload_failed",
+                            )
                         if stop_reason == "decoder_cache_lost_after_output":
                             raise BackendContractError(
                                 "Decoder lost KV after output; replay would duplicate tokens",

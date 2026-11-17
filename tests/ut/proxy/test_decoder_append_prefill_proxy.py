@@ -512,11 +512,10 @@ async def test_decoder_local_stream_preserves_empty_choice_usage_chunk(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_decoder_local_recovery_reports_final_pd_route_and_cache_source(monkeypatch):
+async def test_pd_recovery_preserves_legacy_route_and_cache_source(monkeypatch):
     scheduler = make_dp4_scheduler()
-    runtime, _ = install_mock_backends(monkeypatch, scheduler)
+    runtime, seen = install_mock_backends(monkeypatch, scheduler)
     try:
-        await consume_proxy_response(FakeRequest({"X-Session-ID": "recover-session"}))
         decoder_key = next(iter(scheduler.decoders))
         decoder_client = runtime._clients[proxy.ServerRole.DECODE][decoder_key]
         await decoder_client.aclose()
@@ -542,20 +541,75 @@ async def test_decoder_local_recovery_reports_final_pd_route_and_cache_source(mo
             base_url="http://127.0.0.1:8200/v1",
             transport=httpx.MockTransport(backend),
         )
-        response, body = await consume_proxy_response(
-            FakeRequest(
-                {"X-Session-ID": "recover-session"},
-            )
-        )
-        assert response.headers["X-Proxy-Route"] == "decoder_local"
-        assert body["proxy_metrics"]["initial_route"] == "decoder_local"
+        response, body = await consume_proxy_response(FakeRequest())
+        assert response.headers["X-Proxy-Route"] == "pd"
+        assert body["proxy_metrics"]["initial_route"] == "pd"
         assert body["proxy_metrics"]["final_route"] == "pd"
         assert body["proxy_metrics"]["recovered"] is True
         assert body["proxy_metrics"]["recovery_count"] == 1
         assert body["proxy_metrics"]["cached_tokens_source"] == "prefiller"
         assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 128
         assert [request.headers["x-data-parallel-rank"] for request in decoder_calls] == ["0", "0"]
+        assert [port for port, _, _ in seen] == [8100, 8100]
         assert scheduler.healthcheck()["request_num"] == 0
+    finally:
+        await runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("has_output", [False, True])
+@pytest.mark.parametrize("chat", [False, True])
+async def test_decoder_local_recompute_signal_fails_without_prefiller_retry(monkeypatch, stream, has_output, chat):
+    scheduler = make_dp4_scheduler()
+    bind_and_finish_first_turn(scheduler)
+    runtime, _ = install_mock_backends(monkeypatch, scheduler)
+    seen = []
+    streams = []
+
+    def backend(request):
+        seen.append(request.url.port)
+        content = "partial" if has_output else ""
+        choice = {"message": {"content": content}} if chat else {"text": content}
+        result = {"choices": [{**choice, "stop_reason": "recomputed"}]}
+        if not stream:
+            return httpx.Response(200, json=result)
+        frames = []
+        if has_output:
+            prior = {"delta": {"content": content}} if chat else {"text": content}
+            frames.append({"choices": [prior]})
+        frames.append({"choices": [{"stop_reason": "recomputed"}]})
+        response_stream = Frames(frames)
+        streams.append(response_stream)
+        return httpx.Response(200, stream=response_stream)
+
+    for clients in runtime._clients.values():
+        for key, client in list(clients.items()):
+            await client.aclose()
+            clients[key] = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(backend))
+    payload = {"stream": stream, "max_tokens": 64}
+    if chat:
+        payload["messages"] = [{"role": "user", "content": "followup"}]
+    else:
+        payload["prompt"] = "followup"
+    try:
+        response = await proxy.handle_completions_impl(
+            "/chat/completions" if chat else "/completions",
+            FakeRequest({"X-Session-ID": "session-1"}, payload),
+        )
+        chunks = [chunk async for chunk in response.body_iterator]
+        result = json.loads(chunks[-1][6:] if stream else b"".join(chunks))
+        assert response.status_code == (200 if stream else 502)
+        assert result["error"]["code"] == "decoder_offload_failed"
+        assert result["proxy_metrics"]["initial_route"] == result["proxy_metrics"]["final_route"] == "decoder_local"
+        assert result["proxy_metrics"]["recovery_count"] == 0
+        assert seen == [8200]
+        assert all(response_stream.closed for response_stream in streams)
+        assert scheduler.request_num == 0
+        assert scheduler.healthcheck()["in_flight_sessions"] == 0
+        assert all(server.active_tokens == 0 for server in scheduler.decoders.values())
+        assert all(server.active_kv_cache == 0 for server in scheduler.prefillers.values())
+        assert scheduler.session_affinities["session-1"].turn_count == 1
     finally:
         await runtime.close()
 
@@ -844,6 +898,7 @@ async def test_pd_cache_miss_never_repeats_admission_fallback(monkeypatch, strea
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["decoder_cache_lost_after_output", "recomputed"])
 @pytest.mark.parametrize(
     "prior",
     [
@@ -853,7 +908,7 @@ async def test_pd_cache_miss_never_repeats_admission_fallback(monkeypatch, strea
         {"delta": {"tool_calls": [{"id": "call1"}]}},
     ],
 )
-async def test_cache_loss_after_output_never_replays(monkeypatch, prior):
+async def test_cache_loss_after_output_never_replays(monkeypatch, prior, reason):
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
     runtime, seen = install_mock_backends(monkeypatch, scheduler)
@@ -862,7 +917,7 @@ async def test_cache_loss_after_output_never_replays(monkeypatch, prior):
     async def decode_stream(*args, **kwargs):
         try:
             yield b"data: " + json.dumps({"choices": [prior]}).encode() + b"\n\n"
-            yield b'data: {"choices":[{"text":"","stop_reason":"decoder_cache_lost_after_output"}]}\n\n'
+            yield b"data: " + json.dumps({"choices": [{"text": "", "stop_reason": reason}]}).encode() + b"\n\n"
         finally:
             closed.append(True)
 
@@ -876,7 +931,8 @@ async def test_cache_loss_after_output_never_replays(monkeypatch, prior):
             ),
         )
         chunks = [c async for c in response.body_iterator]
-        assert json.loads(chunks[-1][6:])["error"]["code"] == "decoder_cache_lost_after_output"
+        expected_code = "decoder_offload_failed" if reason == "recomputed" else reason
+        assert json.loads(chunks[-1][6:])["error"]["code"] == expected_code
         assert not seen  # No P call after the injected D stream.
         assert closed == [True]
         assert scheduler.request_num == 0

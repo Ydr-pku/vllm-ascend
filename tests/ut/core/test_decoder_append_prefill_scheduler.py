@@ -612,10 +612,10 @@ def test_recompute_only_adds_decoder_admission_hooks():
     """Keep unrelated Recompute scheduling and version behavior at its baseline."""
     tree = ast.parse((ROOT / "vllm_ascend/core/recompute_scheduler.py").read_text())
     expected_hooks = {
-        "_can_admit_decoder_waiting_request": ast.parse(
-            '''def _can_admit_decoder_waiting_request(self, request: Request) -> bool:
-    """Hook for decoder-local admission while traversing waiting requests."""
-    return True
+        "_is_pending_decoder_cache_rejection": ast.parse(
+            '''def _is_pending_decoder_cache_rejection(self, request: Request) -> bool:
+    """Hook for requests awaiting decoder-local cache-rejection output."""
+    return False
 '''
         ).body[0],
         "_can_admit_local_prefix": ast.parse(
@@ -638,7 +638,7 @@ def test_recompute_only_adds_decoder_admission_hooks():
 
         def visit_If(self, node):
             if ast.unparse(node.test) in {
-                "not self._can_admit_decoder_waiting_request(request)",
+                "self._is_pending_decoder_cache_rejection(request)",
                 "not self._can_admit_local_prefix(request, num_new_local_computed_tokens)",
             }:
                 expected = ast.parse("skip_request(request_queue)\ncontinue").body
@@ -811,9 +811,9 @@ def test_recompute_does_not_treat_preemption_count_as_recovery_state(runtime, co
 
 @pytest.mark.parametrize("marked", [False, True])
 @pytest.mark.parametrize("offload", ["saved", "full", "exception"])
-def test_recompute_preemption_preserves_protocol_and_batch_order(runtime, combined, marked, offload):
+def test_recompute_preemption_keeps_base_offload_and_failure_protocol(runtime, combined, marked, offload):
     req = enqueue(runtime, combined, marked=marked, hits=16)
-    earlier = combined.schedule()
+    combined.schedule()
     combined.running.remove(req)
     combined.connector = recovery_connector()
     hook = combined.connector.update_state_before_preempt
@@ -829,19 +829,11 @@ def test_recompute_preemption_preserves_protocol_and_batch_order(runtime, combin
         assert not combined.rejected_requests and not combined._recomputed_reqs
         return
     batch = Output(recomputed_reqs=combined._recomputed_reqs, num_scheduled_tokens={}, total_num_scheduled_tokens=0)
-    combined._record_decoder_cache_rejections(batch, combined.rejected_requests)
-    if marked:
-        # The original in-flight batch must still be delivered before rejection.
-        output = empty_model_output()
-        output.sampled_token_ids = [[42]]
-        output.req_id_to_index = {req.request_id: 0}
-        result = combined.update_from_output(earlier, output)
-        assert result[2].outputs[0].new_token_ids == [42]
-        assert not combined._recomputed_reqs
+    # The legacy base scheduler still reports return-to-P on offload failure.
+    # The proxy rejects this signal for Decoder-local requests without replay.
+    assert not combined.rejected_requests
     result = combined.update_from_output(batch, empty_model_output())
-    assert [out.stop_reason for out in result[2].outputs] == [
-        "decoder_cache_lost_after_output" if marked else "recomputed"
-    ]
+    assert [out.stop_reason for out in result[2].outputs] == ["recomputed"]
     assert req.request_id not in combined.requests
 
 

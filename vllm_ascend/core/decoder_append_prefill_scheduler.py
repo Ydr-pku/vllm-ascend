@@ -54,6 +54,9 @@ class DecoderCacheAdmissionMixin(_SchedulerBase):
     def __init__(self, *args, **kwargs) -> None:
         # Scheduler policy compatibility is validated in platform._check_ascend_config.
         super().__init__(*args, **kwargs)
+        # Requests awaiting a terminal cache-rejection output when their batch
+        # completes. Keep them out of later scheduling passes in the meantime.
+        # Store the Request identity so a reused request ID is not rejected.
         self._pending_decoder_cache_rejections: dict[str, Request] = {}
         # EngineCore retains each SchedulerOutput until update_from_output, so
         # its identity can key this local request list without storing it again.
@@ -100,7 +103,7 @@ class DecoderCacheAdmissionMixin(_SchedulerBase):
         request_ids = []
         for request in requests:
             request_id = request.request_id
-            if self._pending_decoder_cache_rejections.get(request_id) is request:
+            if self._is_pending_decoder_cache_rejection(request):
                 del self._pending_decoder_cache_rejections[request_id]
             request_ids.append(request_id)
         for request in self.finish_requests(request_ids, RequestStatus.FINISHED_STOPPED):
@@ -1155,9 +1158,6 @@ class DecoderAppendPrefillRecomputeScheduler(DecoderCacheAdmissionMixin, Recompu
             if (hook := getattr(connector, "has_preempted_request", None)) is not None
         )
 
-    def _can_admit_decoder_waiting_request(self, request: Request) -> bool:
-        return not self._is_pending_decoder_cache_rejection(request)
-
     def _can_admit_local_prefix(self, request: Request, local_hits: int) -> bool:
         if self._is_restoring_decoder_request(request):
             return True
@@ -1174,16 +1174,6 @@ class DecoderAppendPrefillRecomputeScheduler(DecoderCacheAdmissionMixin, Recompu
             # Never turn a failed restore into an implicit local full prefill.
             self._pending_decoder_cache_rejections[request.request_id] = request
             self.rejected_requests.append(request)
-
-    def _finish_recomputed_request(self, request: Request) -> None:
-        if not self._requires_decoder_cache_hit(request):
-            return super()._finish_recomputed_request(request)
-        # The victim was removed from running by Recompute. Preserve it until
-        # this batch completes, so older in-flight output drains before deciding
-        # whether replay is safe. Upstream preemption fences KV block freeing.
-        Scheduler._preempt_request(self, request, time.monotonic(), drop_stale_output=self.requires_kv_delivery)
-        self._pending_decoder_cache_rejections[request.request_id] = request
-        self.rejected_requests.append(request)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.rejected_requests: list[Request] = []
