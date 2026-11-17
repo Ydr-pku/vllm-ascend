@@ -11,8 +11,9 @@ The schedule body is copied from vLLM 24420b7a341af37a9bc3186e6fc6062512e0aa58:
 there is no upstream hook that can reject one waiting request and continue the
 same scheduling iteration. Feature deltas are per-step rejection bookkeeping,
 skipping pending rejections, and the admission guard. Mooncake matching relies
-on transfer parameters supplied by the proxy. The supported baselines are v0.33.0
-and the verified main revision above; keep the drift test aligned.
+on transfer parameters supplied by the proxy. This feature targets the verified
+main revision above; release-version compatibility is not maintained. Keep the
+drift test aligned.
 
 DyntraLB is currently unsupported: it requires Decoder instances to execute
 decode-only work, while this scheduler also executes append-prefill on Decoders.
@@ -76,13 +77,6 @@ class DecoderCacheAdmissionMixin(_SchedulerBase):
         # the common resumable boundary for a strictly local request instead.
         blocks, num_local, shared_boundary = self.kv_cache_manager.get_computed_blocks(request, max_cache_hit_length)
         return blocks, num_local, shared_boundary, False
-
-    @staticmethod
-    def _skip_reading_external_kv(request: Request) -> bool:
-        # v0.33.0 retains the old name; the verified main uses the external-KV name.
-        if hasattr(request, "skip_reading_external_kv"):
-            return request.skip_reading_external_kv
-        return request.skip_reading_prefix_cache
 
     def _should_reject_decoder_cache_miss(self, request: Request, local_hits: int) -> bool:
         return self._requires_decoder_cache_hit(request) and local_hits <= 0
@@ -566,8 +560,7 @@ class DecoderAppendPrefillScheduler(DecoderCacheAdmissionMixin, Scheduler):
                         ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
                             request, block_aligned_local
                         )
-                        # delta for vllm_compat: normalize the v0.33.0/main Request property name.
-                        if self._skip_reading_external_kv(request):
+                        if request.skip_reading_external_kv:
                             ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:

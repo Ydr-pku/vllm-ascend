@@ -29,8 +29,8 @@ ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "vllm_ascend/core/decoder_append_prefill_scheduler.py"
 COPY_BASELINE_VLLM_REVISION = "24420b7a341af37a9bc3186e6fc6062512e0aa58"
 # Generated independently from Scheduler.schedule in the declared copy baseline.
-# The installed dependency can also be the supported v0.33.0 release, whose
-# upstream schedule legitimately differs from that main-branch snapshot.
+# Decoder Append-Prefill targets main. The release CI lane still checks the
+# existing Recompute implementation and platform logic independently.
 COPY_BASELINE_SCHEDULE_SHA256 = "4bf4b86f7d7a0244cd44ee57229243a75ef093b70756cb24d739256ebf0d2480"
 # Preserve the existing Ascend Recompute implementation independently of the
 # vLLM copy used by DecoderAppendPrefillScheduler.
@@ -42,6 +42,11 @@ if not VLLM.is_dir():
     if spec is None or spec.origin is None:
         raise RuntimeError("Install the target vLLM or set VLLM_SOURCE_ROOT to its checkout.")
     VLLM = Path(spec.origin).parent
+
+# Identify only the exact official v0.33.0 Request source used by release CI.
+# A missing main API in any other source must fail rather than be skipped.
+V033_REQUEST_SOURCE_SHA256 = "dd7c30bf8b0894dc123a739c299c0133566f8cc075b081e45905f1c29506e69d"
+IS_V033_REQUEST_SOURCE = hashlib.sha256((VLLM / "v1/request.py").read_bytes()).hexdigest() == V033_REQUEST_SOURCE_SHA256
 
 
 class Output(SimpleNamespace):
@@ -194,6 +199,15 @@ def ordinary_scheduler(runtime, request):
 
 
 def make_scheduler(runtime, class_name, *, prefill_interval=1, lookahead_tokens=0, use_v2_model_runner=False):
+    if class_name in {
+        "DecoderAppendPrefillScheduler",
+        "AsyncDecoderAppendPrefillScheduler",
+        "DecoderAppendPrefillRecomputeScheduler",
+        "AsyncDecoderAppendPrefillRecomputeScheduler",
+    }:
+        if IS_V033_REQUEST_SOURCE:
+            pytest.skip("Decoder Append-Prefill targets verified vLLM main; v0.33.0 is unsupported.")
+        assert isinstance(runtime.NativeRequest.skip_reading_external_kv, property)
     cls = getattr(runtime, class_name)
     # Execute the real installed Scheduler constructor. Only its cache/event
     # factories are faked, so release-only missing fields cannot be hidden by
@@ -584,11 +598,6 @@ def test_only_documented_admission_deltas_change_schedule():
             condition = ast.unparse(node.test)
             if "_is_pending_decoder_cache_rejection" in condition or "_should_reject_decoder_cache_miss" in condition:
                 return None
-            return self.generic_visit(node)
-
-        def visit_Call(self, node):
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "_skip_reading_external_kv":
-                return ast.parse("request.skip_reading_external_kv", mode="eval").body
             return self.generic_visit(node)
 
         def visit_Expr(self, node):
@@ -1407,15 +1416,11 @@ def test_append_prefill_config_rejects_conflicting_policy_before_selection(
     selector.assert_not_called()
 
 
-def test_external_kv_skip_uses_the_installed_request_api(runtime, ordinary_scheduler):
+def test_external_kv_skip_uses_the_main_request_api(runtime, ordinary_scheduler):
     scheduler = ordinary_scheduler
     req = enqueue(runtime, scheduler, marked=False)
-    if hasattr(runtime.NativeRequest, "skip_reading_external_kv"):
-        assert not hasattr(req, "skip_reading_prefix_cache")
-        req.prefix_cache_hit_limit = 0
-    else:
-        assert not hasattr(req, "skip_reading_external_kv")
-        req.skip_reading_prefix_cache = True
+    assert not hasattr(req, "skip_reading_prefix_cache")
+    req.prefix_cache_hit_limit = 0
     scheduler.connector = Mock(supports_divergent_local_hybrid_hits=False)
     scheduler.connector.get_num_new_matched_tokens.return_value = (16, False)
     output = scheduler.schedule()
