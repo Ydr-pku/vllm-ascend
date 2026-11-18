@@ -33,10 +33,12 @@ COPY_BASELINE_VLLM_REVISION = "24420b7a341af37a9bc3186e6fc6062512e0aa58"
 # Decoder Append-Prefill targets main. The release CI lane still checks the
 # existing Recompute implementation and platform logic independently.
 COPY_BASELINE_SCHEDULE_SHA256 = "4bf4b86f7d7a0244cd44ee57229243a75ef093b70756cb24d739256ebf0d2480"
-# Preserve the existing Ascend Recompute implementation independently of the
-# vLLM copy used by DecoderAppendPrefillScheduler.
-RECOMPUTE_BASELINE_ASCEND_REVISION = "40354ac766a869832d62ef3baa78cb59e59f7f9f"
-RECOMPUTE_BASELINE_MODULE_SHA256 = "1b64ea51be78f4b659eea5259aa7a224593d17f29c413ef89a8764cab155a16d"
+# Canonical AST hashes from upstream Ascend, before and after Recompute
+# stopped passing num_common_prefix_blocks to the scheduler output.
+RECOMPUTE_BASELINE_HASH_BY_REVISION = {
+    "40354ac766a869832d62ef3baa78cb59e59f7f9f": "1b64ea51be78f4b659eea5259aa7a224593d17f29c413ef89a8764cab155a16d",
+    "4be68c18cfc6ff8b1d9df48efa45ef426a42e49d": "d03a934903add36185b4cc18b3fd77fdac61ecc2938d48e1e104eb8a615e5ffd",
+}
 VLLM = Path(os.environ.get("VLLM_SOURCE_ROOT", ROOT.parent / "vllm")) / "vllm"
 if not VLLM.is_dir():
     spec = importlib.util.find_spec("vllm")
@@ -666,7 +668,7 @@ def test_recompute_only_adds_decoder_admission_hooks():
 
     actual = StripHooks().visit(tree)
     encoded = json.dumps(canonical_ast(actual), separators=(",", ":")).encode()
-    assert hashlib.sha256(encoded).hexdigest() == RECOMPUTE_BASELINE_MODULE_SHA256
+    assert hashlib.sha256(encoded).hexdigest() in RECOMPUTE_BASELINE_HASH_BY_REVISION.values()
 
 
 @pytest.mark.parametrize("async_enabled", [False, True])
