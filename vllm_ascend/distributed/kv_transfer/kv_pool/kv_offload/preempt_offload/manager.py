@@ -390,7 +390,7 @@ class PreemptOffloadScheduler:
                             waiting_for_store = True
                         else:
                             cpu_block = next(cpu_block_iter)
-                            cpu_block._block_hash = block_hash
+                            cpu_block.set_block_hash(block_hash, num_tokens=gpu_block.block_hash_num_tokens)
                             self._pending_hash_blocks[block_hash] = cpu_block
                             store_gpu_block_ids.append(gpu_block.block_id)
                             store_cpu_block_ids.append(cpu_block.block_id)

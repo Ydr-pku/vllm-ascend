@@ -11,9 +11,8 @@ The schedule body is copied from vLLM 24420b7a341af37a9bc3186e6fc6062512e0aa58:
 there is no upstream hook that can reject one waiting request and continue the
 same scheduling iteration. Feature deltas are per-step rejection bookkeeping,
 skipping pending rejections, and the admission guard. Mooncake matching relies
-on transfer parameters supplied by the proxy. This feature targets the verified
-main revision above; release-version compatibility is not maintained. Keep the
-drift test aligned.
+on transfer parameters supplied by the proxy. Keep the drift test aligned with
+the copy revision above.
 
 DyntraLB is currently unsupported: it requires Decoder instances to execute
 decode-only work, while this scheduler also executes append-prefill on Decoders.

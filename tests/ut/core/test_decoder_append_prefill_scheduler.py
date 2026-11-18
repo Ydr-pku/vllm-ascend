@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from contextlib import nullcontext
@@ -226,6 +227,8 @@ def make_scheduler(runtime, class_name, *, prefill_interval=1, lookahead_tokens=
             watermark=0.0,
             prefill_schedule_interval=prefill_interval,
             scheduler_reserve_full_isl=False,
+            cache_aware_admission_window=0,
+            cache_aware_admission_threshold=0.5,
         ),
         cache_config=SimpleNamespace(
             num_gpu_blocks=128,
@@ -272,7 +275,12 @@ def make_scheduler(runtime, class_name, *, prefill_interval=1, lookahead_tokens=
     )
     scheduler = cls(
         vllm_config=config,
-        kv_cache_config=SimpleNamespace(kv_cache_groups=[], has_mamba_layers=False, needs_kv_cache_zeroing=False),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[],
+            has_mamba_layers=False,
+            needs_kv_cache_zeroing=False,
+            hisparse_host_num_blocks=None,
+        ),
         structured_output_manager=Mock(accept_tokens=Mock(return_value=True)),
         block_size=16,
         include_finished_set=True,
@@ -318,7 +326,7 @@ def make_scheduler(runtime, class_name, *, prefill_interval=1, lookahead_tokens=
         return_sampling_mask=False,
         is_mm_encoder_only=False,
         structured_output_manager=Mock(accept_tokens=Mock(return_value=True)),
-        kv_cache_config=SimpleNamespace(kv_cache_groups=[None]),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[None], hisparse_host_num_blocks=None),
         use_v2_model_runner=use_v2_model_runner,
         model_uses_mrope=False,
         prev_step_scheduled_req_ids=set(),
@@ -347,6 +355,7 @@ def make_scheduler(runtime, class_name, *, prefill_interval=1, lookahead_tokens=
     manager.empty_kv_cache_blocks = empty_blocks
     manager.get_computed_blocks.return_value = (empty_blocks, 0, 0)
     manager.allocate_slots.return_value = empty_blocks
+    manager.coordinator.get_num_blocks_to_allocate.return_value = 0
     manager.get_num_common_prefix_blocks.return_value = [0]
     manager.take_boundary_state_offloads.return_value = {}
     manager.take_kv_cache_block_copies.return_value = ([], [])
@@ -673,7 +682,7 @@ def test_constructor_preserves_async_setup(runtime, monkeypatch, async_enabled):
     assert instance._pending_decoder_cache_rejections == {}
     assert instance._decoder_cache_rejection_batches == {}
     if async_enabled:
-        assert instance._spec_token_placeholders == [-1, -1]
+        assert instance.decode_stagger == 1
 
 
 @pytest.mark.parametrize("async_enabled", [False, True])
@@ -1066,6 +1075,9 @@ def cache_runtime():
         defaultdict=defaultdict,
         contextlib=contextlib,
         itertools=itertools,
+        weakref=weakref,
+        # GC tracking does not affect the cache/offload control flow under test.
+        gc_untrack=lambda obj: obj,
         Sequence=Sequence,
         cdiv=lambda a, b: (a + b - 1) // b,
         FullAttentionSpec=type("FullAttentionSpec", (), {}),
@@ -1133,11 +1145,15 @@ def test_restored_a_finishes_and_b_reuses_new_npu_blocks(runtime, combined, cach
     combined.connector.get_num_new_matched_tokens.side_effect = manager.get_num_new_matched_tokens
     assert combined._preempt_or_recompute(req, 1.0)
     state = manager._preempted_req_states["A"]
+    cpu_block = cpu_pool.blocks[state.cpu_block_ids[0][0]]
+    assert cpu_block.block_hash_num_tokens == old[0].block_hash_num_tokens
+    assert cpu_pool.get_cached_block(req.block_hashes[0], [0]) is None
     # Complete the simulated D2H event before allowing the source to be reused.
     manager._preempt_store_event_to_blocks[0] = state.store_transfer_meta
     manager._preempt_store_event_to_reqs[0] = ["A"]
     manager._process_preempt_store_event(0)
     assert state.ready
+    assert cpu_pool.get_cached_block(req.block_hashes[0], [0]) == [cpu_block]
     unrelated = pool.get_new_blocks(pool.get_num_free_blocks())
     assert pool.get_cached_block(req.block_hashes[0], [0]) is None
     # Release different blocks for restore, retaining A's old IDs elsewhere.
@@ -1233,7 +1249,7 @@ def test_combined_constructor_initializes_state(runtime, monkeypatch, async_enab
     obj = cls(vllm_config=config)
     assert obj._pending_decoder_cache_rejections == obj._decoder_cache_rejection_batches == {}
     if async_enabled:
-        assert obj._spec_token_placeholders == [-1, -1]
+        assert obj.decode_stagger == 1
 
 
 @pytest.fixture
@@ -1382,11 +1398,17 @@ def test_append_prefill_config_selects_scheduler_like_dyntra_lb(platform_runtime
 
 @pytest.mark.parametrize("role", [None, "kv_producer", "kv_both"])
 @pytest.mark.parametrize("recompute", [False, True])
-def test_append_prefill_config_rejects_non_decoder_nodes(platform_runtime, role, recompute):
-    config, ascend_config = make_platform_config(role=role, recompute=recompute, append_prefill=True)
-    with pytest.raises(ValueError, match="kv_consumer"):
+@pytest.mark.parametrize("explicit_scheduler", [False, True], ids=["feature_flag", "scheduler_cls"])
+def test_append_prefill_config_rejects_non_decoder_nodes(platform_runtime, role, recompute, explicit_scheduler):
+    selected = None
+    if explicit_scheduler:
+        selected = "vllm_ascend.core.decoder_append_prefill_scheduler.DecoderAppendPrefillScheduler"
+    config, ascend_config = make_platform_config(
+        role=role, recompute=recompute, selected=selected, append_prefill=not explicit_scheduler
+    )
+    with pytest.raises(ValueError, match="Decoder append-prefill is only supported on PD-disaggregated D nodes"):
         platform_runtime._check_ascend_config(config, ascend_config)
-    assert config.scheduler_config.scheduler_cls is None
+    assert config.scheduler_config.scheduler_cls == selected
 
 
 @pytest.mark.parametrize(
@@ -1561,11 +1583,7 @@ def test_existing_recompute_variants_keep_their_admission_policy(runtime, monkey
 def test_output_fields_follow_the_installed_worker_contract(runtime, scheduler):
     req = enqueue(runtime, scheduler, marked=False, hits=16)
     output = scheduler.schedule()
-    if isinstance(scheduler, runtime.RecomputeScheduler):
-        # Recompute retains the existing Ascend worker-output contract.
-        assert output.num_common_prefix_blocks == [0]
-        scheduler.kv_cache_manager.get_num_common_prefix_blocks.assert_called_once_with(req.request_id)
-    else:
-        assert output.encoder_input_updates == {}
-        assert output.num_common_prefix_blocks == []
-        scheduler.kv_cache_manager.get_num_common_prefix_blocks.assert_not_called()
+    assert isinstance(output, runtime.SchedulerOutput)
+    assert output.num_scheduled_tokens == {req.request_id: 16}
+    assert output.encoder_input_updates == {}
+    scheduler.kv_cache_manager.get_num_common_prefix_blocks.assert_not_called()
