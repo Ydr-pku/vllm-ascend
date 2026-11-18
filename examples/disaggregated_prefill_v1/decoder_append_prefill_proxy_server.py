@@ -88,11 +88,12 @@ _abort_prefill_selection = base_proxy._abort_prefill_selection
 parse_server_addresses = base_proxy.parse_server_addresses
 
 logger = logging.getLogger(__name__)
+SSE_DONE = b"data: [DONE]\n\n"
 
 
 # delta for decoder_append_prefill: frame complete SSE events for admission and stream-completion handling.
 class SSEFramer:
-    """Reassemble OpenAI JSON SSE events independently of HTTP chunk boundaries."""
+    """Parse complete OpenAI SSE events independently of HTTP chunk boundaries."""
 
     def __init__(self, limit: int = 8 * 1024 * 1024) -> None:
         if limit <= 0:
@@ -103,7 +104,7 @@ class SSEFramer:
         self.limit = limit
         self._event_size = 0
 
-    def feed(self, chunk: bytes) -> list[bytes]:
+    def feed(self, chunk: bytes) -> list[dict[str, Any] | bytes]:
         self.buffer += chunk
         frames = []
         while b"\n" in self.buffer:
@@ -122,12 +123,12 @@ class SSEFramer:
                     raise ValueError("SSE data received after DONE")
                 if payload == b"[DONE]":
                     self.done = True
-                    frames.append(b"data: [DONE]\n\n")
+                    frames.append(SSE_DONE)
                 else:
                     obj = json.loads(payload.decode("utf-8"))
                     if not isinstance(obj, dict):
                         raise ValueError("SSE JSON event must be an object")
-                    frames.append(b"data: " + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n")
+                    frames.append(obj)
             elif line.startswith(b"data:"):
                 self.data.append(line[5:].removeprefix(b" "))
         if self._event_size + len(self.buffer) > self.limit:
@@ -204,6 +205,7 @@ class SessionAffinity:
     last_access_time: float
     state: SessionState
     decoder_dp_rank: int | None = None
+    invalidated: bool = False
 
 
 def setup_logging(log_level: str) -> None:
@@ -370,7 +372,7 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
             decoder_available = (
                 affinity.decoder_key in decoder_pool.servers and affinity.decoder_key not in decoder_pool.tainted
             )
-            if not decoder_available:
+            if affinity.invalidated or not decoder_available:
                 self.session_affinities.pop(session_id, None)
                 return
             if success:
@@ -383,12 +385,17 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
 
     def invalidate_all_sessions(self) -> None:
         with self._lock:
-            self.session_affinities.clear()
+            self._invalidate_sessions_no_lock()
 
-    def _invalidate_decoder_sessions_no_lock(self, decoder_keys: set[str]) -> None:
+    def _invalidate_sessions_no_lock(self, decoder_keys: set[str] | None = None) -> None:
         for session_id, affinity in list(self.session_affinities.items()):
-            if affinity.decoder_key in decoder_keys:
-                self.session_affinities.pop(session_id, None)
+            if decoder_keys is not None and affinity.decoder_key not in decoder_keys:
+                continue
+            if affinity.state is SessionState.IN_FLIGHT:
+                # Release the busy guard only when its owning request finishes.
+                affinity.invalidated = True
+            else:
+                del self.session_affinities[session_id]
 
     def remove_instances(self, role: ServerRole, instances: list[tuple[str, int]]) -> bool:
         if not instances:
@@ -396,7 +403,7 @@ class SharedProxyScheduler(base_proxy.SharedProxyScheduler):
         keys = {server_key(host, port) for host, port in instances}
         with self._lock:
             if role is ServerRole.DECODE:
-                self._invalidate_decoder_sessions_no_lock(keys)
+                self._invalidate_sessions_no_lock(keys)
             return super().remove_instances(role, instances)
 
 
@@ -726,6 +733,7 @@ async def stream_service_response(
     max_retries: int = 3,
     base_delay: float = 0.2,
 ):
+    """Yield parsed SSE events and SSE_DONE, or one non-streaming body."""
     headers = decoder_headers(request_id, decoder_dp_rank)
     max_attempts = max(1, max_retries)
     for attempt in range(1, max_attempts + 1):
@@ -899,8 +907,7 @@ async def assign_decoder_local(
     decoder = await runtime.schedule(
         "begin_decoder_request", route.pinned_decoder_key, decoder_score, route.pinned_decoder_dp_rank
     )
-    req_data.pop("kv_transfer_params", None)
-    req_data["vllm_xargs"] = dict(req_data.get("vllm_xargs") or {})
+    req_data["vllm_xargs"] = req_data.get("vllm_xargs") or {}
     req_data["vllm_xargs"]["require_decoder_cache_hit"] = 1
     return InstanceInfo(
         route_mode=RouteMode.DECODER_LOCAL,
@@ -950,12 +957,13 @@ async def reassign_instances(
     request_length: int,
     previous_instance: InstanceInfo,
     *,
+    previous_prefiller_kv_released: bool,
     route_reason: str = "recomputed_fallback",
 ) -> InstanceInfo:
     runtime = get_runtime()
-    if previous_instance.prefiller_key is not None:
+    if not previous_prefiller_kv_released and previous_instance.prefiller_key is not None:
         await runtime.schedule("release_prefill_kv", previous_instance.prefiller_key, previous_instance.prefiller_score)
-        previous_instance.prefiller_key = None
+    previous_instance.prefiller_key = None
     await runtime.schedule("release_decoder", previous_instance.decoder_key, previous_instance.decoder_score)
     # If P admission fails, the caller still owns the old InstanceInfo and
     # finishes its request count. Its D reservation has already been released.
@@ -972,7 +980,7 @@ async def reassign_instances(
     )
 
 
-async def _replay_first_chunk(first_chunk: bytes, gen: Any):
+async def _replay_first_chunk(first_chunk: dict[str, Any] | bytes, gen: Any):
     """Replay a pre-read first chunk, then stream the rest of ``gen``.
 
     ``handle_completions_impl`` pre-reads the first chunk of the decode stream
@@ -981,7 +989,7 @@ async def _replay_first_chunk(first_chunk: bytes, gen: Any):
     still receives the full stream.
     """
     try:
-        if first_chunk:
+        if first_chunk != b"":
             yield first_chunk
         async for chunk in gen:
             yield chunk
@@ -1082,7 +1090,6 @@ async def handle_completions_impl(api: str, request: Request):
         # HTTP status code instead of an empty 200. On success the opened stream
         # (first chunk already read) is handed to generate_stream via these vars.
         preopened_gen = None
-        preopened_first = b""
         decoder_client = await runtime.get_client(ServerRole.DECODE, instance_info.decoder_key)
         preopened_gen = stream_service_response(
             decoder_client,
@@ -1094,9 +1101,7 @@ async def handle_completions_impl(api: str, request: Request):
             base_delay=args.retry_delay,
         )
         try:
-            preopened_first = await preopened_gen.__anext__()
-        except StopAsyncIteration:
-            preopened_first = b""
+            preopened_first = await anext(preopened_gen, b"")
         except httpx.HTTPStatusError as exc:
             await _finish_instance(runtime, instance_info, release_prefill_kv=True)
             request_released = True
@@ -1156,14 +1161,6 @@ async def handle_completions_impl(api: str, request: Request):
             local_admission_pending = stream_flag and instance_info.route_mode is RouteMode.DECODER_LOCAL
             pending_admission_chunks: list[bytes] = []
 
-            async def release_prefill_kv_once() -> None:
-                nonlocal released_kv
-                if not released_kv and instance_info.prefiller_key is not None:
-                    await runtime.schedule(
-                        "release_prefill_kv", instance_info.prefiller_key, instance_info.prefiller_score
-                    )
-                    released_kv = True
-
             released_kv = instance_info.prefiller_key is None
 
             try:
@@ -1185,30 +1182,30 @@ async def handle_completions_impl(api: str, request: Request):
                             max_retries=args.max_retries,
                             base_delay=args.retry_delay,
                         )
-                    async for chunk in gen:
-                        if not released_kv and chunk:
-                            await release_prefill_kv_once()
-                        try:
-                            chunk_str = chunk.decode("utf-8").strip()
-                        except UnicodeDecodeError:
-                            logger.debug("Skipping chunk: %s", chunk)
-                            yield chunk
-                            continue
-                        if not chunk_str:
-                            continue
-                        is_sse = chunk_str.startswith("data: ")
-                        if is_sse:
-                            chunk_str = chunk_str[len("data: ") :]
-                        try:
-                            chunk_json = json.loads(chunk_str)
-                        except json.JSONDecodeError:
-                            logger.debug("Skipping chunk: %s", chunk_str)
+                    async for event in gen:
+                        if not released_kv and event != b"" and instance_info.prefiller_key is not None:
+                            await runtime.schedule(
+                                "release_prefill_kv", instance_info.prefiller_key, instance_info.prefiller_score
+                            )
+                            released_kv = True
+                        if not isinstance(event, bytes):
+                            chunk_json = event
+                        elif event == SSE_DONE:
                             for pending_chunk in pending_admission_chunks:
                                 yield pending_chunk
                             pending_admission_chunks.clear()
-                            local_admission_pending = False
-                            yield chunk
+                            yield event
                             continue
+                        else:
+                            try:
+                                body = event.decode("utf-8").strip()
+                                if not body:
+                                    continue
+                                chunk_json = json.loads(body)
+                            except (UnicodeDecodeError, json.JSONDecodeError):
+                                logger.debug("Passing through an invalid JSON response: %s", event)
+                                yield event
+                                continue
                         # HTTP headers describe the initial route and cannot be
                         # changed after streaming starts. The final JSON (or
                         # parsed SSE chunks) records any recompute recovery so
@@ -1232,17 +1229,16 @@ async def handle_completions_impl(api: str, request: Request):
                                 "prefiller" if instance_info.prefiller_key is not None else "decoder"
                             ),
                         }
-                        chunk = encode_response_chunk(chunk_json, is_sse)
                         choices = chunk_json.get("choices", [])
                         if not choices or not stream_flag:
-                            if update_cached_tokens_in_chunk(chunk_json, reported_prefiller_cached_tokens):
-                                chunk = encode_response_chunk(chunk_json, is_sse)
-                            if not choices:
-                                if local_admission_pending:
-                                    pending_admission_chunks.append(chunk)
-                                else:
-                                    yield chunk
-                                continue
+                            update_cached_tokens_in_chunk(chunk_json, reported_prefiller_cached_tokens)
+                        if not choices:
+                            chunk = encode_response_chunk(chunk_json, stream_flag)
+                            if local_admission_pending:
+                                pending_admission_chunks.append(chunk)
+                            else:
+                                yield chunk
+                            continue
 
                         choice = choices[0]
                         delta = choice.get("delta") or {}
@@ -1288,6 +1284,7 @@ async def handle_completions_impl(api: str, request: Request):
                                     req_data,
                                     request_length,
                                     instance_info,
+                                    previous_prefiller_kv_released=released_kv,
                                     route_reason="decoder_cache_miss_fallback",
                                 )
                             except BackendContractError:
@@ -1327,10 +1324,14 @@ async def handle_completions_impl(api: str, request: Request):
                             else:
                                 req_data["prompt"] = origin_prompt + generated_token
                             req_data["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
-                            # delta for decoder_append_prefill: adapt legacy replay admission and session binding.
-                            (req_data.get("vllm_xargs") or {}).pop("require_decoder_cache_hit", None)
                             tmp_request_length = len(json.dumps(req_data).encode("utf-8"))
-                            instance_info = await reassign_instances(api, req_data, tmp_request_length, instance_info)
+                            instance_info = await reassign_instances(
+                                api,
+                                req_data,
+                                tmp_request_length,
+                                instance_info,
+                                previous_prefiller_kv_released=released_kv,
+                            )
                             reported_prefiller_cached_tokens = instance_info.prefiller_cached_tokens
                             if route.session_id is not None:
                                 await runtime.schedule(
@@ -1356,7 +1357,7 @@ async def handle_completions_impl(api: str, request: Request):
                                 choice["message"]["content"] = generated_token
                             else:
                                 choice["text"] = generated_token
-                            chunk = encode_response_chunk(chunk_json, is_sse)
+                        chunk = encode_response_chunk(chunk_json, stream_flag)
                         # delta for decoder_append_prefill: release buffered metadata after local admission succeeds.
                         if local_admission_pending:
                             # Chat serving sends its role/prompt metadata before
@@ -1451,10 +1452,7 @@ async def handle_completions_impl(api: str, request: Request):
             # Resolve admission fallback before committing a non-streaming HTTP
             # status. Leave the generator paused at its response so ownership
             # and the session busy guard remain live until delivery or cleanup.
-            try:
-                first_response_chunk = await response_gen.__anext__()
-            except StopAsyncIteration:
-                first_response_chunk = b""
+            first_response_chunk = await anext(response_gen, b"")
             response_content = _replay_first_chunk(first_response_chunk, response_gen)
 
         # delta for decoder_append_prefill: retain cleanup ownership until response delivery or finalization.

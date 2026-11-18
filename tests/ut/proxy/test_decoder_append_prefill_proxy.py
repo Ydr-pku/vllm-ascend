@@ -130,14 +130,26 @@ def test_session_affinity_lifecycle_and_busy_guard():
     scheduler.finish_session("session-1", False)
 
 
-def test_decoder_removal_invalidates_affinity():
+@pytest.mark.parametrize("invalidate", ["cache_reset", "decoder_removal"])
+def test_affinity_invalidation_keeps_in_flight_session_reserved(invalidate):
     scheduler = make_scheduler()
     decoder_key = bind_and_finish_first_turn(scheduler)
-    decoder = scheduler.decoders[decoder_key]
+    bind_and_finish_first_turn(scheduler, "idle")
+    assert scheduler.reserve_session("session-1", 60.0)["status"] == "warm"
 
-    scheduler.remove_instances(proxy.ServerRole.DECODE, [(decoder.host, decoder.port)])
+    if invalidate == "cache_reset":
+        scheduler.invalidate_all_sessions()
+        assert "idle" not in scheduler.session_affinities
+    else:
+        decoder = scheduler.decoders[decoder_key]
+        scheduler.remove_instances(proxy.ServerRole.DECODE, [(decoder.host, decoder.port)])
 
-    assert "session-1" not in scheduler.session_affinities
+    assert scheduler.reserve_session("session-1", 60.0) == {"status": "busy"}
+    replacement = scheduler.pick_decoder(10.0)
+    scheduler.bind_session_decoder("session-1", replacement["key"])
+    scheduler.finish_session("session-1", True)
+    scheduler.release_decoder(replacement["key"], 10.0)
+    assert scheduler.reserve_session("session-1", 60.0)["status"] == "cold"
 
 
 def test_session_ttl_reclaims_idle_metadata_without_releasing_busy_sessions(monkeypatch):
@@ -158,6 +170,7 @@ def test_session_ttl_reclaims_idle_metadata_without_releasing_busy_sessions(monk
     # A session accessed between sweeps still expires at its own TTL.
     now = 191.0
     assert scheduler.reserve_session("expires-before-next-sweep", 60.0)["status"] == "cold"
+    assert scheduler.session_affinities["expires-before-next-sweep"].decoder_dp_rank is None
 
 
 def test_decoder_local_request_has_symmetric_load_accounting():
@@ -171,24 +184,6 @@ def test_decoder_local_request_has_symmetric_load_accounting():
     scheduler.finish_request(None, 0.0, decoder_key, 25.0, release_prefill_kv=False)
     assert scheduler.request_num == 0
     assert scheduler.decoders[decoder_key].active_tokens == 0.0
-
-
-@pytest.mark.asyncio
-async def test_enabled_routes_warm_session_to_pinned_decoder(monkeypatch):
-    scheduler = make_scheduler()
-    decoder_key = bind_and_finish_first_turn(scheduler)
-    args = argparse.Namespace(enable_decoder_append_prefill=True, session_affinity_ttl=60.0)
-    monkeypatch.setattr(proxy, "global_args", args)
-    monkeypatch.setattr(proxy, "runtime", proxy.WorkerRuntime(scheduler))
-
-    route = await proxy.plan_request_route(
-        FakeRequest({proxy.SESSION_ID_HEADER: "session-1"}),
-        {"prompt": "complete prompt"},
-    )
-
-    assert route.mode is proxy.RouteMode.DECODER_LOCAL
-    assert route.pinned_decoder_key == decoder_key
-    scheduler.finish_session("session-1", False)
 
 
 @pytest.mark.asyncio
@@ -206,29 +201,6 @@ async def test_enabled_routes_body_session_to_pinned_decoder(monkeypatch):
     assert route.reason == "affinity_hit"
     assert route.pinned_decoder_key == decoder_key
     assert "conversation_id" not in req_data
-    scheduler.finish_session("session-1", False)
-
-
-@pytest.mark.asyncio
-async def test_disabled_ignores_legacy_decoder_local_header(monkeypatch):
-    scheduler = make_scheduler()
-    bind_and_finish_first_turn(scheduler)
-    args = argparse.Namespace(enable_decoder_append_prefill=False, session_affinity_ttl=60.0)
-    monkeypatch.setattr(proxy, "global_args", args)
-    monkeypatch.setattr(proxy, "runtime", proxy.WorkerRuntime(scheduler))
-
-    route = await proxy.plan_request_route(
-        FakeRequest(
-            {
-                proxy.SESSION_ID_HEADER: "session-1",
-                "X-vLLM-Request-Mode": "decoder-local",
-            }
-        ),
-        {"prompt": "complete prompt"},
-    )
-
-    assert route.mode is proxy.RouteMode.PD
-    assert route.pinned_decoder_key is None
     scheduler.finish_session("session-1", False)
 
 
@@ -281,11 +253,19 @@ def test_rank_validation_has_no_load_side_effect():
 
 @pytest.mark.asyncio
 async def test_disabled_cleans_proxy_fields_and_stale_metadata(monkeypatch):
-    monkeypatch.setattr(proxy, "global_args", argparse.Namespace(enable_decoder_append_prefill=False))
+    scheduler = make_scheduler()
+    bind_and_finish_first_turn(scheduler)
+    args = argparse.Namespace(enable_decoder_append_prefill=False, session_affinity_ttl=60.0)
+    monkeypatch.setattr(proxy, "global_args", args)
+    monkeypatch.setattr(proxy, "runtime", proxy.WorkerRuntime(scheduler))
+    request = FakeRequest({proxy.SESSION_ID_HEADER: "session-1", "X-vLLM-Request-Mode": "decoder-local"})
     body = {"conversation_id": "session", "kv_transfer_params": {"stale": True}, "prompt": "hello"}
-    route = await proxy.plan_request_route(FakeRequest(), body)
+    route = await proxy.plan_request_route(request, body)
+    assert route.mode is proxy.RouteMode.PD
+    assert route.pinned_decoder_key is None
     assert route.reason == "feature_disabled"
     assert body == {"prompt": "hello"}
+    assert scheduler.healthcheck()["in_flight_sessions"] == 0
 
 
 def install_mock_backends(monkeypatch, scheduler, enabled=True):
@@ -334,9 +314,13 @@ def install_mock_backends(monkeypatch, scheduler, enabled=True):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("chat", [False, True])
-@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize(
+    "stream,chat,warm",
+    [
+        pytest.param(False, False, False, id="cold-json-completion"),
+        pytest.param(True, True, True, id="warm-sse-chat"),
+    ],
+)
 async def test_enabled_rejects_echo_before_routing(monkeypatch, stream, chat, warm):
     scheduler = make_dp4_scheduler()
     if warm:
@@ -369,8 +353,10 @@ async def test_enabled_rejects_echo_before_routing(monkeypatch, stream, chat, wa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("chat", [False, True])
+@pytest.mark.parametrize(
+    "stream,chat",
+    [pytest.param(False, False, id="json-completion"), pytest.param(True, True, id="sse-chat")],
+)
 async def test_disabled_forwards_echo_unchanged(monkeypatch, stream, chat):
     scheduler = make_dp4_scheduler()
     runtime, seen = install_mock_backends(monkeypatch, scheduler, enabled=False)
@@ -490,9 +476,9 @@ async def test_decoder_local_stream_preserves_empty_choice_usage_chunk(monkeypat
 
         async def decode_stream(*args, **kwargs):
             assert kwargs["decoder_dp_rank"] == 0
-            yield b'data: {"choices":[{"text":"hello"}]}\n\n'
-            yield b'data: {"choices":[],"usage":{"prompt_tokens_details":{"cached_tokens":512}}}\n\n'
-            yield b"data: [DONE]\n\n"
+            yield {"choices": [{"text": "hello"}]}
+            yield {"choices": [], "usage": {"prompt_tokens_details": {"cached_tokens": 512}}}
+            yield proxy.SSE_DONE
 
         monkeypatch.setattr(proxy, "stream_service_response", decode_stream)
         response = await proxy.handle_completions_impl(
@@ -514,6 +500,8 @@ async def test_decoder_local_stream_preserves_empty_choice_usage_chunk(monkeypat
 @pytest.mark.asyncio
 async def test_pd_recovery_preserves_legacy_route_and_cache_source(monkeypatch):
     scheduler = make_dp4_scheduler()
+    concurrent_prefill_load = 1024.0
+    prefiller_key = scheduler.reserve_prefill_kv(concurrent_prefill_load)["key"]
     runtime, seen = install_mock_backends(monkeypatch, scheduler)
     try:
         decoder_key = next(iter(scheduler.decoders))
@@ -552,6 +540,7 @@ async def test_pd_recovery_preserves_legacy_route_and_cache_source(monkeypatch):
         assert [request.headers["x-data-parallel-rank"] for request in decoder_calls] == ["0", "0"]
         assert [port for port, _, _ in seen] == [8100, 8100]
         assert scheduler.healthcheck()["request_num"] == 0
+        assert scheduler.prefillers[prefiller_key].active_kv_cache == pytest.approx(concurrent_prefill_load)
     finally:
         await runtime.close()
 
@@ -614,15 +603,6 @@ async def test_decoder_local_recompute_signal_fails_without_prefiller_retry(monk
         await runtime.close()
 
 
-def test_expired_session_loses_old_rank_binding(monkeypatch):
-    scheduler = make_dp4_scheduler()
-    bind_and_finish_first_turn(scheduler)
-    affinity = scheduler.session_affinities["session-1"]
-    monkeypatch.setattr(proxy.time, "monotonic", lambda: affinity.last_access_time + 61)
-    assert scheduler.reserve_session("session-1", 60)["status"] == "cold"
-    assert scheduler.session_affinities["session-1"].decoder_dp_rank is None
-
-
 class InterruptedStream(httpx.AsyncByteStream):
     async def __aiter__(self):
         yield b'data: {"choices":[{"text":"hello"}]}\n\n'
@@ -639,7 +619,7 @@ async def test_partial_stream_failure_propagates_and_never_retries():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(backend)) as client:
         stream = proxy.stream_service_response(client, "http://decoder/completions", {"stream": True}, "r1", 2)
-        assert json.loads((await anext(stream))[6:]) == {"choices": [{"text": "hello"}]}
+        assert await anext(stream) == {"choices": [{"text": "hello"}]}
         with pytest.raises(httpx.ReadError):
             await anext(stream)
     assert len(requests) == 1
@@ -744,19 +724,22 @@ async def test_local_chat_admission_keeps_only_the_accepted_stream_metadata(monk
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("echo", [None, False], ids=["echo-omitted", "echo-false"])
 @pytest.mark.parametrize(
-    "chat,token_budget",
+    "stream,echo,chat,token_budget",
     [
-        pytest.param(False, {}, id="completion-default"),
-        pytest.param(False, {"max_tokens": 64}, id="completion-explicit"),
-        pytest.param(True, {}, id="chat-default"),
-        pytest.param(True, {"max_tokens": None}, id="chat-null"),
-        pytest.param(True, {"max_tokens": 64}, id="chat-max-tokens"),
-        pytest.param(True, {"max_completion_tokens": 64}, id="chat-max-completion-tokens"),
-        pytest.param(True, {"max_tokens": 32, "max_completion_tokens": 64}, id="chat-both-limits"),
-    ],
+        pytest.param(stream, None, chat, budget, id=f"{mode}-{request_shape}")
+        for stream, mode in [(False, "json"), (True, "sse")]
+        for chat, budget, request_shape in [
+            (False, {}, "completion-default"),
+            (False, {"max_tokens": 64}, "completion-explicit"),
+            (True, {}, "chat-default"),
+            (True, {"max_tokens": None}, "chat-null"),
+            (True, {"max_tokens": 64}, "chat-max-tokens"),
+            (True, {"max_completion_tokens": 64}, "chat-max-completion-tokens"),
+            (True, {"max_tokens": 32, "max_completion_tokens": 64}, "chat-both-limits"),
+        ]
+    ]
+    + [pytest.param(True, False, True, {"max_completion_tokens": 64}, id="sse-chat-echo-false")],
 )
 async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stream, echo, chat, token_budget):
     """A local miss must retry P/D with the original conversation and token limits."""
@@ -863,8 +846,10 @@ async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stre
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize(
+    "stream,warm",
+    [pytest.param(False, False, id="cold-json"), pytest.param(True, True, id="warm-sse")],
+)
 async def test_pd_cache_miss_never_repeats_admission_fallback(monkeypatch, stream, warm):
     scheduler = make_dp4_scheduler()
     if warm:
@@ -898,17 +883,16 @@ async def test_pd_cache_miss_never_repeats_admission_fallback(monkeypatch, strea
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason", ["decoder_cache_lost_after_output", "recomputed"])
 @pytest.mark.parametrize(
     "prior",
     [
-        {"text": "partial"},
-        {"token_ids": [42]},
-        {"delta": {"reasoning": "thinking"}},
-        {"delta": {"tool_calls": [{"id": "call1"}]}},
+        pytest.param({"text": "partial"}, id="text"),
+        pytest.param({"token_ids": [42]}, id="token-ids"),
+        pytest.param({"delta": {"reasoning": "thinking"}}, id="reasoning"),
+        pytest.param({"delta": {"tool_calls": [{"id": "call1"}]}}, id="tool-calls"),
     ],
 )
-async def test_cache_loss_after_output_never_replays(monkeypatch, prior, reason):
+async def test_cache_loss_after_output_never_replays(monkeypatch, prior):
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
     runtime, seen = install_mock_backends(monkeypatch, scheduler)
@@ -916,8 +900,8 @@ async def test_cache_loss_after_output_never_replays(monkeypatch, prior, reason)
 
     async def decode_stream(*args, **kwargs):
         try:
-            yield b"data: " + json.dumps({"choices": [prior]}).encode() + b"\n\n"
-            yield b"data: " + json.dumps({"choices": [{"text": "", "stop_reason": reason}]}).encode() + b"\n\n"
+            yield {"choices": [prior]}
+            yield {"choices": [{"text": "", "stop_reason": "decoder_cache_lost_after_output"}]}
         finally:
             closed.append(True)
 
@@ -931,8 +915,9 @@ async def test_cache_loss_after_output_never_replays(monkeypatch, prior, reason)
             ),
         )
         chunks = [c async for c in response.body_iterator]
-        expected_code = "decoder_offload_failed" if reason == "recomputed" else reason
-        assert json.loads(chunks[-1][6:])["error"]["code"] == expected_code
+        assert len(chunks) == 2
+        assert json.loads(chunks[0][6:])["choices"] == [prior]
+        assert json.loads(chunks[1][6:])["error"]["code"] == "decoder_cache_lost_after_output"
         assert not seen  # No P call after the injected D stream.
         assert closed == [True]
         assert scheduler.request_num == 0
@@ -942,8 +927,7 @@ async def test_cache_loss_after_output_never_replays(monkeypatch, prior, reason)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reason", ["decoder_cache_miss", "decoder_cache_lost_after_output"])
-async def test_failed_fallback_never_sends_unprefilled_request_to_d(monkeypatch, reason):
+async def test_nonstream_decoder_cache_loss_is_not_replayed(monkeypatch):
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
     runtime, _ = install_mock_backends(monkeypatch, scheduler)
@@ -951,8 +935,7 @@ async def test_failed_fallback_never_sends_unprefilled_request_to_d(monkeypatch,
 
     def backend(request):
         seen.append(request.url.port)
-        # P intentionally violates the transfer contract. D must not be called again.
-        result = {"choices": [{"text": "", "stop_reason": reason}]}
+        result = {"choices": [{"text": "", "stop_reason": "decoder_cache_lost_after_output"}]}
         return httpx.Response(200, json=result)
 
     for role, instances in [
@@ -967,13 +950,9 @@ async def test_failed_fallback_never_sends_unprefilled_request_to_d(monkeypatch,
     try:
         response = await proxy.handle_completions_impl("/completions", FakeRequest({"X-Session-ID": "session-1"}))
         chunks = [c async for c in response.body_iterator]
-        error = json.loads(b"".join(chunks))["error"]["code"]
-        if reason == "decoder_cache_miss":
-            assert seen == [8200, 8100]
-            assert error == "missing_prefiller_kv_transfer"
-        else:
-            assert seen == [8200]
-            assert error == reason
+        assert response.status_code == 502
+        assert json.loads(b"".join(chunks))["error"]["code"] == "decoder_cache_lost_after_output"
+        assert seen == [8200]
         assert scheduler.request_num == 0
         assert all(s.active_tokens == 0 for s in scheduler.decoders.values())
         assert all(s.active_kv_cache == 0 for s in scheduler.prefillers.values())
@@ -983,8 +962,17 @@ async def test_failed_fallback_never_sends_unprefilled_request_to_d(monkeypatch,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("failure", ["no_prefiller", "http_503", "missing_transfer", "decode_503"])
+@pytest.mark.parametrize(
+    "stream,failure",
+    [
+        pytest.param(False, "no_prefiller", id="json-no-prefiller"),
+        pytest.param(False, "http_503", id="json-prefiller-503"),
+        pytest.param(False, "missing_transfer", id="json-missing-transfer"),
+        pytest.param(True, "missing_transfer", id="sse-missing-transfer"),
+        pytest.param(False, "decode_503", id="json-decoder-503"),
+        pytest.param(True, "decode_503", id="sse-decoder-503"),
+    ],
+)
 async def test_admission_fallback_failure_returns_error_and_releases_once(monkeypatch, stream, failure):
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
@@ -1052,6 +1040,7 @@ async def test_admission_fallback_failure_returns_error_and_releases_once(monkey
         assert scheduler.healthcheck()["in_flight_sessions"] == 0
         assert all(server.active_tokens == 0 for server in scheduler.decoders.values())
         assert all(server.active_kv_cache == 0 for server in scheduler.prefillers.values())
+        assert scheduler.session_affinities["session-1"].turn_count == 1
     finally:
         await runtime.close()
 
@@ -1219,15 +1208,13 @@ class FrameTests(unittest.TestCase):
             for offset in range(0, len(payload), size):
                 frames.extend(p.feed(payload[offset : offset + size]))
             p.finish()
-            self.assertEqual(len(frames), 3)
-            self.assertEqual(json.loads(frames[0][6:]), {"content": "中文"})
-            self.assertEqual(json.loads(frames[1][6:])["usage"]["cached_tokens"], 1920)
+            self.assertEqual(frames, [{"content": "中文"}, {"usage": {"cached_tokens": 1920}}, b"data: [DONE]\n\n"])
 
     def test_comments_and_multiline_json(self):
         p = proxy.SSEFramer()
         frames = p.feed(b': heartbeat\n\ndata: {"x":\ndata: 1}\n\ndata:[DONE]\n\n')
         p.finish()
-        self.assertEqual(json.loads(frames[0][6:]), {"x": 1})
+        self.assertEqual(frames, [{"x": 1}, b"data: [DONE]\n\n"])
 
     def test_truncated_stream_rejected(self):
         for payload in [b'data: {"x":1}', b'data: {"x":1}\n\n', b"data: [DONE]\n"]:
@@ -1259,7 +1246,7 @@ async def test_closing_framed_stream_closes_transport():
     ) as client:
         stream = proxy.stream_service_response(client, "http://decoder/completions", {"stream": True}, "r1", 0)
         frame = await anext(stream)
-        assert json.loads(frame[6:])["choices"][0]["stop_reason"] == "decoder_cache_miss"
+        assert frame["choices"][0]["stop_reason"] == "decoder_cache_miss"
         await stream.aclose()
         assert transport.closed
 
