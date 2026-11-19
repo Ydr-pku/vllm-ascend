@@ -533,8 +533,6 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("Number of decoder hosts must match number of decoder ports")
     if args.session_affinity_ttl <= 0:
         raise ValueError("Session affinity TTL must be greater than zero")
-    if args.decoder_data_parallel_size <= 0:
-        raise ValueError("Decoder data parallel size must be greater than zero")
     args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
     return args
@@ -1027,18 +1025,6 @@ async def handle_completions_impl(api: str, request: Request):
     released_kv = False
     try:
         req_data = await request.json()
-        if args.enable_decoder_append_prefill and req_data.get("echo", False):
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": {
-                        "message": "Decoder append-prefill requires echo=false; omit echo or set it to false.",
-                        "type": "invalid_request_error",
-                        "param": "echo",
-                        "code": "unsupported_echo",
-                    }
-                },
-            )
         req_body = await request.body()
         request_length = len(req_body)
         try:
@@ -1073,6 +1059,7 @@ async def handle_completions_impl(api: str, request: Request):
             instance_info.decoder_engine_epoch,
         )
         stream_flag = bool(req_data.get("stream", False))
+        streaming_echo = stream_flag and bool(req_data.get("echo", False))
         initial_route = instance_info.route_mode.value
         chat_flag = "messages" in req_data
 
@@ -1267,6 +1254,11 @@ async def handle_completions_impl(api: str, request: Request):
                                     "Invalid Decoder cache-miss admission response",
                                     "invalid_decoder_cache_miss",
                                 )
+                            if streaming_echo and not local_admission_pending:
+                                raise BackendContractError(
+                                    "Decoder reported a cache miss after forwarding output",
+                                    "decoder_cache_lost_after_output",
+                                )
                             # This is an admission fallback, not recovery after
                             # Decoder prefill. Preserve the entire original
                             # prompt/history and generation budget.
@@ -1360,9 +1352,18 @@ async def handle_completions_impl(api: str, request: Request):
                         chunk = encode_response_chunk(chunk_json, stream_flag)
                         # delta for decoder_append_prefill: release buffered metadata after local admission succeeds.
                         if local_admission_pending:
-                            # Chat serving sends its role/prompt metadata before
-                            # the zero-output admission result. Keep those frames
-                            # private until the local attempt actually proceeds.
+                            # Chat's separate echo choice omits token_ids. Engine
+                            # output choices set it explicitly, even to null.
+                            # Completion attaches prompt_token_ids to the first
+                            # echoed choice, which can also carry a generated token.
+                            output_choices = choices
+                            if streaming_echo:
+                                if chat_flag:
+                                    output_choices = [choice for choice in choices if "token_ids" in choice]
+                                else:
+                                    output_choices = [
+                                        choice for choice in choices if choice.get("prompt_token_ids") is None
+                                    ]
                             has_output = any(
                                 candidate.get("token_ids")
                                 or candidate.get("text")
@@ -1370,9 +1371,13 @@ async def handle_completions_impl(api: str, request: Request):
                                 or any(
                                     value for name, value in (candidate.get("delta") or {}).items() if name != "role"
                                 )
-                                for candidate in choices
+                                for candidate in output_choices
                             )
-                            finished = any(candidate.get("finish_reason") is not None for candidate in choices)
+                            # Keep echo-only finishes buffered until DONE, since
+                            # another choice can still report a zero-token miss.
+                            finished = not streaming_echo and any(
+                                candidate.get("finish_reason") is not None for candidate in choices
+                            )
                             if not has_output and not finished:
                                 pending_admission_chunks.append(chunk)
                                 continue

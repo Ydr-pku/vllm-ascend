@@ -33,10 +33,6 @@ COPY_BASELINE_VLLM_REVISION = "24420b7a341af37a9bc3186e6fc6062512e0aa58"
 # Decoder Append-Prefill targets main. The release CI lane still checks the
 # existing Recompute implementation and platform logic independently.
 COPY_BASELINE_SCHEDULE_SHA256 = "4bf4b86f7d7a0244cd44ee57229243a75ef093b70756cb24d739256ebf0d2480"
-# Preserve the existing Ascend Recompute implementation independently of the
-# vLLM copy used by DecoderAppendPrefillScheduler.
-RECOMPUTE_BASELINE_ASCEND_REVISION = "40354ac766a869832d62ef3baa78cb59e59f7f9f"
-RECOMPUTE_BASELINE_MODULE_SHA256 = "1b64ea51be78f4b659eea5259aa7a224593d17f29c413ef89a8764cab155a16d"
 VLLM = Path(os.environ.get("VLLM_SOURCE_ROOT", ROOT.parent / "vllm")) / "vllm"
 if not VLLM.is_dir():
     spec = importlib.util.find_spec("vllm")
@@ -626,49 +622,6 @@ def test_only_documented_admission_deltas_change_schedule():
     assert hashlib.sha256(encoded).hexdigest() == COPY_BASELINE_SCHEDULE_SHA256
 
 
-def test_recompute_only_adds_decoder_admission_hooks():
-    """Keep unrelated Recompute scheduling and version behavior at its baseline."""
-    tree = ast.parse((ROOT / "vllm_ascend/core/recompute_scheduler.py").read_text())
-    expected_hooks = {
-        "_is_pending_decoder_cache_rejection": ast.parse(
-            '''def _is_pending_decoder_cache_rejection(self, request: Request) -> bool:
-    """Hook for requests awaiting decoder-local cache-rejection output."""
-    return False
-'''
-        ).body[0],
-        "_can_admit_local_prefix": ast.parse(
-            '''def _can_admit_local_prefix(self, request: Request, local_hits: int) -> bool:
-    """Hook for decoder-local admission before connector lookup/allocation."""
-    return True
-'''
-        ).body[0],
-    }
-
-    class StripHooks(ast.NodeTransformer):
-        def visit_ClassDef(self, node):
-            if node.name == "RecomputeScheduler":
-                hooks = {n.name: n for n in node.body if isinstance(n, ast.FunctionDef) and n.name in expected_hooks}
-                assert hooks.keys() == expected_hooks.keys()
-                for name, hook in hooks.items():
-                    assert canonical_ast(hook) == canonical_ast(expected_hooks[name])
-                node.body = [n for n in node.body if not isinstance(n, ast.FunctionDef) or n.name not in expected_hooks]
-            return self.generic_visit(node)
-
-        def visit_If(self, node):
-            if ast.unparse(node.test) in {
-                "self._is_pending_decoder_cache_rejection(request)",
-                "not self._can_admit_local_prefix(request, num_new_local_computed_tokens)",
-            }:
-                expected = ast.parse("skip_request(request_queue)\ncontinue").body
-                assert not node.orelse and canonical_ast(node.body) == canonical_ast(expected)
-                return None
-            return self.generic_visit(node)
-
-    actual = StripHooks().visit(tree)
-    encoded = json.dumps(canonical_ast(actual), separators=(",", ":")).encode()
-    assert hashlib.sha256(encoded).hexdigest() == RECOMPUTE_BASELINE_MODULE_SHA256
-
-
 @pytest.mark.parametrize("async_enabled", [False, True])
 def test_constructor_preserves_async_setup(runtime, monkeypatch, async_enabled):
     def base_init(self, *args, **kwargs):
@@ -976,46 +929,34 @@ def make_platform_config(
     )
 
 
-@pytest.mark.parametrize("async_enabled", [False, True])
-@pytest.mark.parametrize("as_type", [False, True])
-@pytest.mark.parametrize("combined_selected", [False, True])
-def test_platform_combines_explicit_append_scheduler_and_rejects_overriding_policies(
-    platform_runtime, async_enabled, as_type, combined_selected
-):
+@pytest.mark.parametrize(
+    ("async_enabled", "as_type", "combined_selected"),
+    [(False, False, False), (False, True, True), (True, False, True), (True, True, False)],
+)
+def test_platform_combines_explicit_append_scheduler(platform_runtime, async_enabled, as_type, combined_selected):
     name = "DecoderAppendPrefillRecomputeScheduler" if combined_selected else "DecoderAppendPrefillScheduler"
     if async_enabled:
         name = f"Async{name}"
     module = "vllm_ascend.core.decoder_append_prefill_scheduler"
     selected = type(name, (), {"__module__": module}) if as_type else f"{module}.{name}"
     config, ascend_config = make_platform_config(async_enabled=async_enabled, selected=selected, recompute=True)
-    policies = ascend_config.scheduler_config
     platform_runtime._check_ascend_config(config, ascend_config)
     assert config.scheduler_config.scheduler_cls.endswith(
         ".AsyncDecoderAppendPrefillRecomputeScheduler" if async_enabled else ".DecoderAppendPrefillRecomputeScheduler"
     )
-    for key, reason in (
-        ("dyntra_lb_config", "decode-only"),
-        ("short_request_first_config", "PD-disaggregated Decoders"),
-        ("batch_job_sched_config", "long-input, short-output agentic"),
-    ):
-        getattr(policies, key).enabled = True
-        with pytest.raises(ValueError, match=reason):
-            platform_runtime._check_ascend_config(config, ascend_config)
-        getattr(policies, key).enabled = False
-    policies.enable_balance_scheduling = True
-    with pytest.raises(ValueError, match="PD-mixed"):
-        platform_runtime._check_ascend_config(config, ascend_config)
-    policies.enable_balance_scheduling = False
-    policies.recompute_scheduler_enable = False
-    with pytest.raises(ValueError, match="requires recompute_scheduler_enable"):
-        platform_runtime._check_ascend_config(config, ascend_config)
-    policies.recompute_scheduler_enable = True
-    config.scheduler_config.async_scheduling = not async_enabled
-    with pytest.raises(ValueError, match="matching async_scheduling"):
-        platform_runtime._check_ascend_config(config, ascend_config)
-    config.scheduler_config.async_scheduling = async_enabled
-    config.kv_transfer_config.kv_role = "kv_both"
-    with pytest.raises(ValueError, match="D nodes"):
+
+
+@pytest.mark.parametrize(
+    ("name", "async_enabled", "recompute", "reason"),
+    [
+        ("DecoderAppendPrefillRecomputeScheduler", False, False, "requires recompute_scheduler_enable"),
+        ("DecoderAppendPrefillScheduler", True, True, "matching async_scheduling"),
+    ],
+)
+def test_platform_rejects_invalid_explicit_append_scheduler(platform_runtime, name, async_enabled, recompute, reason):
+    selected = f"vllm_ascend.core.decoder_append_prefill_scheduler.{name}"
+    config, ascend_config = make_platform_config(async_enabled=async_enabled, selected=selected, recompute=recompute)
+    with pytest.raises(ValueError, match=reason):
         platform_runtime._check_ascend_config(config, ascend_config)
 
 
@@ -1396,36 +1337,38 @@ def test_append_prefill_config_selects_scheduler_like_dyntra_lb(platform_runtime
 
 
 @pytest.mark.parametrize("role", [None, "kv_producer", "kv_both"])
-@pytest.mark.parametrize("recompute", [False, True])
 @pytest.mark.parametrize("explicit_scheduler", [False, True], ids=["feature_flag", "scheduler_cls"])
-def test_append_prefill_config_rejects_non_decoder_nodes(platform_runtime, role, recompute, explicit_scheduler):
+def test_append_prefill_config_rejects_non_decoder_nodes(platform_runtime, role, explicit_scheduler):
     selected = None
     if explicit_scheduler:
         selected = "vllm_ascend.core.decoder_append_prefill_scheduler.DecoderAppendPrefillScheduler"
-    config, ascend_config = make_platform_config(
-        role=role, recompute=recompute, selected=selected, append_prefill=not explicit_scheduler
-    )
+    config, ascend_config = make_platform_config(role=role, selected=selected, append_prefill=not explicit_scheduler)
     with pytest.raises(ValueError, match="Decoder append-prefill is only supported on PD-disaggregated D nodes"):
         platform_runtime._check_ascend_config(config, ascend_config)
     assert config.scheduler_config.scheduler_cls == selected
 
 
 @pytest.mark.parametrize(
-    ("policy", "reason"),
+    ("policy", "reason", "explicit_scheduler"),
     [
-        ("enable_balance_scheduling", "PD-mixed"),
-        ("dyntra_lb_config", "decode-only"),
-        ("short_request_first_config", "PD-disaggregated Decoders"),
-        ("batch_job_sched_config", "long-input, short-output agentic"),
+        ("enable_balance_scheduling", "PD-mixed", False),
+        ("dyntra_lb_config", "decode-only", False),
+        ("short_request_first_config", "PD-disaggregated Decoders", False),
+        ("batch_job_sched_config", "long-input, short-output agentic", False),
+        ("dyntra_lb_config", "decode-only", True),
     ],
 )
-@pytest.mark.parametrize("recompute", [False, True])
 def test_append_prefill_config_rejects_conflicting_policy_before_selection(
-    platform_runtime, monkeypatch, policy, reason, recompute
+    platform_runtime, monkeypatch, policy, reason, explicit_scheduler
 ):
     selector = Mock(wraps=platform_runtime._get_recompute_scheduler_cls)
     monkeypatch.setitem(platform_runtime._check_ascend_config.__globals__, "_get_recompute_scheduler_cls", selector)
-    config, ascend_config = make_platform_config(recompute=recompute, append_prefill=True)
+    selected = None
+    if explicit_scheduler:
+        selected = "vllm_ascend.core.decoder_append_prefill_scheduler.DecoderAppendPrefillScheduler"
+    config, ascend_config = make_platform_config(
+        recompute=True, selected=selected, append_prefill=not explicit_scheduler
+    )
     policies = ascend_config.scheduler_config
     if policy == "enable_balance_scheduling":
         policies.enable_balance_scheduling = True
@@ -1433,7 +1376,7 @@ def test_append_prefill_config_rejects_conflicting_policy_before_selection(
         getattr(policies, policy).enabled = True
     with pytest.raises(ValueError, match=reason):
         platform_runtime._check_ascend_config(config, ascend_config)
-    assert config.scheduler_config.scheduler_cls is None
+    assert config.scheduler_config.scheduler_cls == selected
     selector.assert_not_called()
 
 

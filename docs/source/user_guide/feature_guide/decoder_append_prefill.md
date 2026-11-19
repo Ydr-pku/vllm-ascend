@@ -12,7 +12,6 @@ The feature is opt-in in the Decoder configuration and at the proxy. It is inten
 - `scheduler_config.decoder_append_prefill_enable=true` in every Decoder's `--additional-config`. The platform selects the append-prefill admission Scheduler for its synchronous or asynchronous scheduling mode.
 - The standalone `examples/disaggregated_prefill_v1/decoder_append_prefill_proxy_server.py` proxy, started with `--enable-decoder-append-prefill`.
 - A stable session identifier and the complete conversation history on every request. The proxy retains routing affinity, not conversation messages.
-- Requests must omit `echo` or set `echo=false`. The proxy returns HTTP 400 for `echo=true` while append-prefill is enabled.
 
 ## Configure the Decode service
 
@@ -124,6 +123,8 @@ Use `proxy_metrics.initial_route`, `final_route` and `admission_fallback` to dis
 ## Cache misses
 
 On an initial Decoder-local cache miss, the Scheduler rejects the request before prefill or output. The proxy retries through normal P/D with the complete conversation history and original generation budget.
+
+For streaming requests with `echo=true`, the proxy buffers echoed input from the local attempt until it can forward the response. On a cache miss, it discards the buffered echo and forwards the response from the P/D retry.
 
 If that fallback fails, a non-streaming request returns HTTP 502 with an error body. Streaming requests report the error in the response stream because their HTTP headers may already have been sent.
 

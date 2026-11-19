@@ -315,55 +315,21 @@ def install_mock_backends(monkeypatch, scheduler, enabled=True):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "stream,chat,warm",
+    "enabled,stream,chat",
     [
-        pytest.param(False, False, False, id="cold-json-completion"),
-        pytest.param(True, True, True, id="warm-sse-chat"),
+        pytest.param(False, False, False, id="disabled-json-completion"),
+        pytest.param(False, True, True, id="disabled-sse-chat"),
+        pytest.param(True, False, False, id="cold-json-completion"),
     ],
 )
-async def test_enabled_rejects_echo_before_routing(monkeypatch, stream, chat, warm):
+async def test_pd_forwards_echo_unchanged(monkeypatch, enabled, stream, chat):
     scheduler = make_dp4_scheduler()
-    if warm:
-        bind_and_finish_first_turn(scheduler)
-    original_affinities = copy.deepcopy(scheduler.session_affinities)
-    runtime, seen = install_mock_backends(monkeypatch, scheduler)
+    runtime, seen = install_mock_backends(monkeypatch, scheduler, enabled=enabled)
     payload = {"echo": True, "stream": stream, "max_tokens": 64}
     if chat:
         payload["messages"] = [{"role": "assistant", "content": "Existing assistant prefix"}]
         payload["continue_final_message"] = True
-    else:
-        payload["prompt"] = "complete prompt"
-    try:
-        response = await proxy.handle_completions_impl(
-            "/chat/completions" if chat else "/completions",
-            FakeRequest({"X-Session-ID": "session-1"}, payload),
-        )
-        assert response.status_code == 400
-        error = json.loads(response.body)["error"]
-        assert error["type"] == "invalid_request_error"
-        assert error["code"] == "unsupported_echo"
-        assert error["param"] == "echo"
-        assert "echo=false" in error["message"]
-        assert not seen
-        assert scheduler.request_num == 0
-        assert scheduler.session_affinities == original_affinities
-        assert scheduler.healthcheck()["in_flight_sessions"] == 0
-    finally:
-        await runtime.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "stream,chat",
-    [pytest.param(False, False, id="json-completion"), pytest.param(True, True, id="sse-chat")],
-)
-async def test_disabled_forwards_echo_unchanged(monkeypatch, stream, chat):
-    scheduler = make_dp4_scheduler()
-    runtime, seen = install_mock_backends(monkeypatch, scheduler, enabled=False)
-    payload = {"echo": True, "stream": stream, "max_tokens": 64}
-    if chat:
-        payload["messages"] = [{"role": "assistant", "content": "Existing assistant prefix"}]
-        payload["continue_final_message"] = True
+        payload["add_generation_prompt"] = False
     else:
         payload["prompt"] = "complete prompt"
     try:
@@ -379,7 +345,8 @@ async def test_disabled_forwards_echo_unchanged(monkeypatch, stream, chat):
         assert [port for port, _, _ in seen] == [8100, 8200]
         assert all(body["echo"] is True for _, _, body in seen)
         assert scheduler.request_num == 0
-        assert not scheduler.session_affinities
+        assert scheduler.healthcheck()["in_flight_sessions"] == 0
+        assert len(scheduler.session_affinities) == int(enabled)
     finally:
         await runtime.close()
 
@@ -643,7 +610,8 @@ class Frames(httpx.AsyncByteStream):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("local_result", ["miss", "hit", "empty_hit"])
-async def test_local_chat_admission_keeps_only_the_accepted_stream_metadata(monkeypatch, local_result):
+@pytest.mark.parametrize("echo", [False, True], ids=["no-echo", "echo"])
+async def test_local_chat_admission_keeps_only_the_accepted_stream_metadata(monkeypatch, local_result, echo):
     scheduler = make_dp4_scheduler()
     bind_and_finish_first_turn(scheduler)
     runtime, _ = install_mock_backends(monkeypatch, scheduler)
@@ -662,14 +630,21 @@ async def test_local_chat_admission_keeps_only_the_accepted_stream_metadata(monk
         frames = [
             {
                 "id": response_id,
-                "prompt_token_ids": [7, 9],
+                "prompt_token_ids": [7, 9] if body["return_token_ids"] else None,
                 "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}],
                 "usage": {"prompt_tokens": 2, "completion_tokens": 0, "total_tokens": 2},
             }
         ]
+        if echo:
+            assert body["echo"] is True
+            assert "stream_options" not in body
+            frames.append({"id": response_id, "choices": [{"index": 0, "delta": {"content": "prefix "}}]})
         if not miss and local_result != "empty_hit":
             frames.append(
-                {"id": response_id, "choices": [{"index": 0, "delta": {"content": "answer"}, "token_ids": [25]}]}
+                {
+                    "id": response_id,
+                    "choices": [{"index": 0, "delta": {"content": "answer"}, "token_ids": None if echo else [25]}],
+                }
             )
         frames.append(
             {
@@ -696,22 +671,24 @@ async def test_local_chat_admission_keeps_only_the_accepted_stream_metadata(monk
                 base_url=proxy.build_base_url(server.host, server.port), transport=httpx.MockTransport(backend)
             )
     try:
+        messages = [{"role": "user", "content": "followup"}]
+        payload = {"messages": messages, "stream": True, "return_token_ids": not echo, "echo": echo}
+        if echo:
+            messages.append({"role": "assistant", "content": "prefix "})
+            payload.update(continue_final_message=True, add_generation_prompt=False)
         response = await proxy.handle_completions_impl(
             "/chat/completions",
-            FakeRequest(
-                {"X-Session-ID": "session-1"},
-                {"messages": [{"role": "user", "content": "followup"}], "stream": True, "return_token_ids": True},
-            ),
+            FakeRequest({"X-Session-ID": "session-1"}, payload),
         )
         chunks = [chunk async for chunk in response.body_iterator]
         frames = [json.loads(chunk[6:]) for chunk in chunks if chunk != b"data: [DONE]\n\n"]
         expected_id = "fallback-success" if local_result == "miss" else "local-attempt"
         assert {frame["id"] for frame in frames} == {expected_id}
         assert sum(choice["delta"].get("role") == "assistant" for frame in frames for choice in frame["choices"]) == 1
-        assert "".join(choice["delta"].get("content", "") for frame in frames for choice in frame["choices"]) == (
-            "" if local_result == "empty_hit" else "answer"
-        )
-        assert frames[0]["prompt_token_ids"] == [7, 9]
+        expected_text = ("prefix " if echo else "") + ("" if local_result == "empty_hit" else "answer")
+        output_text = "".join(choice["delta"].get("content", "") for frame in frames for choice in frame["choices"])
+        assert output_text == expected_text
+        assert frames[0]["prompt_token_ids"] == (None if echo else [7, 9])
         assert frames[0]["usage"]["prompt_tokens"] == 2
         assert sum(chunk == b"data: [DONE]\n\n" for chunk in chunks) == 1
         assert seen == ([8200, 8100, 8200] if local_result == "miss" else [8200])
@@ -739,7 +716,11 @@ async def test_local_chat_admission_keeps_only_the_accepted_stream_metadata(monk
             (True, {"max_tokens": 32, "max_completion_tokens": 64}, "chat-both-limits"),
         ]
     ]
-    + [pytest.param(True, False, True, {"max_completion_tokens": 64}, id="sse-chat-echo-false")],
+    + [
+        pytest.param(True, False, True, {"max_completion_tokens": 64}, id="sse-chat-echo-false"),
+        pytest.param(True, True, False, {"max_tokens": 64}, id="sse-completion-echo"),
+        pytest.param(False, True, True, {"max_tokens": 64}, id="json-chat-echo"),
+    ],
 )
 async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stream, echo, chat, token_budget):
     """A local miss must retry P/D with the original conversation and token limits."""
@@ -757,6 +738,9 @@ async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stre
             {"role": "assistant", "content": "previous"},
             {"role": "user", "content": "followup"},
         ]
+        if echo:
+            payload["messages"].append({"role": "assistant", "content": "prefix "})
+            payload.update(continue_final_message=True, add_generation_prompt=False)
     else:
         payload["prompt"] = [7, 9, 11, 13]
     original = copy.deepcopy(payload)
@@ -775,7 +759,7 @@ async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stre
                     "usage": {"prompt_tokens_details": {"cached_tokens": 128}},
                 },
             )
-        content = "" if miss else "answer"
+        content = "" if miss else ("prefix " if echo else "") + "answer"
         result = {
             "choices": [
                 {
@@ -788,7 +772,13 @@ async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stre
             "usage": {"completion_tokens": 0 if miss else 1},
         }
         if stream:
-            frames = Frames([result])
+            events = [result]
+            if echo:
+                if miss:
+                    events.insert(0, {"choices": [{"text": "prefix ", "prompt_token_ids": [7, 9, 11, 13]}]})
+                else:
+                    result["choices"][0]["prompt_token_ids"] = [7, 9, 11, 13]
+            frames = Frames(events)
             streams.append(frames)
             return httpx.Response(200, stream=frames)
         return httpx.Response(200, json=result)
@@ -812,7 +802,7 @@ async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stre
         assert [port for port, _, _ in seen] == [8200, 8100, 8200]
         output_choice = result["choices"][0]
         output_text = output_choice["delta" if stream else "message"]["content"] if chat else output_choice["text"]
-        assert output_text == "answer"
+        assert output_text == ("prefix answer" if echo else "answer")
         for port, headers, body in seen:
             assert body.get("prompt") == original.get("prompt")
             assert body.get("messages") == original.get("messages")
@@ -820,7 +810,7 @@ async def test_admission_miss_runs_d_p_d_with_original_request(monkeypatch, stre
             assert body["vllm_xargs"]["other_option"] == 3
             assert ("echo" in body) == ("echo" in original)
             if "echo" in original:
-                assert body["echo"] is False
+                assert body["echo"] is original["echo"]
             if port == 8200:
                 assert headers["x-data-parallel-rank"] == "0"
                 assert {
